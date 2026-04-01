@@ -1,0 +1,3 @@
+/home/nuv203/ssd/kria_xrt_testing/kria_plat/zynqmp_pmufw/build/CMakeFiles/pmufw.elf.dir
+/home/nuv203/ssd/kria_xrt_testing/kria_plat/zynqmp_pmufw/build/CMakeFiles/edit_cache.dir
+/home/nuv203/ssd/kria_xrt_testing/kria_plat/zynqmp_pmufw/build/CMakeFiles/rebuild_cache.dir
