@@ -6,9 +6,7 @@
 
 ## 1. GitHub Repository
 
-[> **TODO:** Replace with your repo URL once created.
->
-> Example: `https://github.com/<username>/ntt-accelerator/blob/main/README.md`](https://github.com/nuv203/ntt_github)
+https://github.com/nuv203/ntt_github
 
 ---
 
