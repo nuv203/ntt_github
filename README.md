@@ -113,7 +113,7 @@ The NTT is an excellent candidate for FPGA acceleration for several reasons:
 
 ### 4.2 Interface: AXI4 Memory-Mapped (Shared Memory)
 
-The IP uses **shared DDR memory via AXI4 master ports** (not AXI4-Stream) for data transfer. This is the simpler integration path for Vitis and matches the existing HLS pragma structure:
+The IP uses **shared DDR memory via AXI4 master ports** (not AXI4-Stream) for data transfer. This is the simpler integration path for Vitis and the XRT workflow, matching the existing HLS pragma structure:
 
 | Port | AXI Bundle | Direction | Description |
 |------|-----------|-----------|-------------|
@@ -176,10 +176,9 @@ The current architecture processes batches **sequentially** — each batch goes 
 
 ### 4.6 Verification Strategy
 
-- **C simulation:** The existing `ntt_tb_cpp.cpp` testbench loads golden vectors (generated from the Python/SymPy reference) and compares against the HLS kernel output.
-- **Python golden model:** `export_vectors.py` generates binary test vectors (`x.bin`, `ref.bin`, `psi_powers.bin`, `twiddles.bin`) from the trusted `negacyclic_ntt_oracle`.
+- **C simulation:** The existing `ntt_tb.cpp` testbench generates golden vectors using an RNG seed, runs the ntt via a standard C implementation, and compares against the HLS kernel output.
 - **Co-simulation:** Vitis HLS C/RTL co-simulation will validate the synthesized RTL matches C-sim results.
-- **On-board test:** After bitstream generation, the host driver will run the same golden vectors through the accelerator on a Zynq/Alveo board and compare results.
+- **On-board test:** After bitstream generation, the IP will be packaged as a .xo file, compiled into a .xclbin, and loaded onto the Kria KV260's Zynq Ultrascale+ for use. The C++ host application will be cross-compiled to run on the Kria KV260, generating its own test vectors and buffering data into the FPGA fabric via the XRT API and compare the generated test vectors with the FPGA output. 
 
 ---
 
