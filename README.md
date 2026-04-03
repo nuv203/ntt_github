@@ -14,8 +14,8 @@ https://github.com/nuv203/ntt_github
 
 | Name | Role |
 |------|------|
-| *(Your name)* | RTL/HLS design, host-side driver, integration |
-| Noam | Architecture, verification, optimization |
+| Niles Peter Villaverde | HLS design, testbench, host-side application |
+| Noam Cicurel | performance optimization, TCP streaming, live-hardware demo |
 
 ---
 
