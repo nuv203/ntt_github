@@ -13,12 +13,25 @@
  *   3. Transpose write scratch address also incremental.
  *==========================================================================*/
 
+/*
+ * Compute Barrett precomputed reciprocal: mu = floor(2^62 / q).
+ *
+ * mu is used by barrett_mod_mul to estimate the quotient (a*b)/q without
+ * a hardware divider. It is computed ONCE per kernel invocation and reused
+ * for every butterfly, so the 63-cycle cost is amortized across millions of ops.
+ *
+ * Why not just write "(1ULL << 62) / q"?
+ * HLS would infer a 64-bit udiv hardware unit (~9.5 ns critical path), which
+ * prevents timing closure at 200 MHz. Shift-subtract long division synthesizes
+ * as a simple loop FSM — no divider unit, just shifts and comparisons.
+ */
 static uint64_t compute_mu(ntt_t q) {
     uint64_t dividend = (uint64_t)1 << 62;
     uint64_t quotient = 0;
     uint64_t remainder = 0;
     uint64_t divisor = (uint64_t)q;
 
+    /* Process one bit of the quotient per iteration, MSB first. */
     COMPUTE_MU_LOOP:
     for (int i = 62; i >= 0; i--) {
 #pragma HLS LOOP_TRIPCOUNT min=63 max=63
@@ -31,47 +44,88 @@ static uint64_t compute_mu(ntt_t q) {
     return quotient;
 }
 
+/*
+ * Barrett modular multiplication: returns (a * b) mod q.
+ *
+ * Algorithm overview:
+ *   1. prod    = a * b                       (up to 62-bit result)
+ *   2. est     = (prod * mu) >> 62           (quotient estimate: ~prod/q)
+ *   3. r       = prod - est * q              (remainder, off by at most +2q)
+ *   4. correct r with up to 2 conditional subtracts
+ *
+ * The challenge in step 2: prod and mu are both ~62-bit, so their product
+ * is ~124-bit. We only need the top 64 bits (the quotient estimate), so we
+ * compute it via four 32x32 partial products and reconstruct the high half.
+ *
+ * Pipeline: II=1 — one new multiply can enter per clock cycle.
+ * Latency min=12: forces HLS to insert ≥12 pipeline registers between DSP48
+ * outputs and downstream logic. This was raised from 10 (v7, 175 MHz) to 12
+ * (v8, 200 MHz) to give Vivado P&R room to meet timing after routing.
+ */
 static ntt_t barrett_mod_mul(ntt_t a, ntt_t b, ntt_t q, uint64_t mu) {
 #pragma HLS PIPELINE II=1
 #pragma HLS LATENCY min=12 max=18
 
+    /* Stage 1: main product — one DSP48 */
     uint64_t prod = (uint64_t)a * (uint64_t)b;
 
+    /* Stage 2: split prod and mu into 32-bit halves for partial products */
     uint32_t pL = (uint32_t)prod;
     uint32_t pH = (uint32_t)(prod >> 32);
     uint32_t mL = (uint32_t)mu;
     uint32_t mH = (uint32_t)(mu >> 32);
 
+    /* Stages 3-4: four independent 32x32 multiplies — HLS maps each to a DSP48.
+     * Together they compute the full 124-bit product (prod * mu). */
     uint64_t pp0 = (uint64_t)pL * mL;
     uint64_t pp1 = (uint64_t)pL * mH;
     uint64_t pp2 = (uint64_t)pH * mL;
     uint64_t pp3 = (uint64_t)pH * mH;
 
+    /* Stages 5-6: carry-propagate to reconstruct bits [62..124] of prod*mu */
     uint64_t mid_lo = (pp0 >> 32) + (uint32_t)pp1 + (uint32_t)pp2;
     uint64_t mid_hi = (pp1 >> 32) + (pp2 >> 32) + (mid_lo >> 32);
     uint64_t hi128  = pp3 + mid_hi;
+
+    /* Stage 7: extract quotient estimate = floor(prod * mu / 2^62).
+     * hi128 holds bits [64..124]; mid_lo bits [32..63] supply the 2 LSBs. */
     uint64_t est = (hi128 << 2) | ((mid_lo >> 30) & 0x3);
 
+    /* Stage 8: est * q — second DSP48 multiply */
     uint64_t est_q = est * (uint64_t)q;
+
+    /* Stage 9: remainder — estimate may overshoot by at most 2 */
     uint64_t r = prod - est_q;
 
+    /* Stages 10-11: correction (max 2 subtracts guaranteed sufficient) */
     if (r >= (uint64_t)q) r -= (uint64_t)q;
     if (r >= (uint64_t)q) r -= (uint64_t)q;
 
     return (ntt_t)r;
 }
 
+/* Modular addition: (a + b) mod q. Single conditional subtract — no multiply. */
 static inline ntt_t mod_add(ntt_t a, ntt_t b, ntt_t q) {
 #pragma HLS INLINE
     ntt_t s = a + b;
     return (s >= q) ? (s - q) : s;
 }
 
+/* Modular subtraction: (a - b) mod q. Avoids underflow by adding q when a < b. */
 static inline ntt_t mod_sub(ntt_t a, ntt_t b, ntt_t q) {
 #pragma HLS INLINE
     return (a >= b) ? (a - b) : (a + q - b);
 }
 
+/*
+ * Bit-reversal of the bottom logN bits of x.
+ *
+ * Used to reorder coefficients into Cooley-Tukey DIT order before the
+ * butterfly stages. The loop is bounded to MAX_LOG_N=20 and FULLY UNROLLED
+ * so HLS synthesizes it as pure combinational logic (zero cycles, zero latency).
+ * The conditional guard "if (i < logN)" prevents unused iterations from
+ * corrupting the result when logN < MAX_LOG_N.
+ */
 static inline uint32_t reverse_bits(uint32_t x, uint32_t logN) {
 #pragma HLS INLINE
     uint32_t r = 0;
@@ -85,6 +139,17 @@ static inline uint32_t reverse_bits(uint32_t x, uint32_t logN) {
     return r;
 }
 
+/*
+ * On-chip Cooley-Tukey DIT NTT for up to TILE_N=4096 points.
+ *
+ * Operates entirely on the on-chip BRAM array 'a[]'. Called both from the
+ * direct path (full N-point transform) and from the four-step path (N2-point
+ * column transforms and N1-point row transforms).
+ *
+ * Twiddle layout (Stockham-packed): tw[span + j] is the j-th twiddle factor
+ * for the butterfly stage where the span is 2^s. Stage 0 uses tw[1], stage 1
+ * uses tw[2..3], stage 2 uses tw[4..7], etc.
+ */
 static void sub_ntt(
     ntt_t a[TILE_N],
     const ntt_t tw[TILE_N],
@@ -93,6 +158,12 @@ static void sub_ntt(
     uint32_t sub_N,
     uint32_t sub_logN
 ) {
+    /*
+     * Bit-reversal permutation: reorder coefficients from natural order into
+     * DIT butterfly order. Swap a[i] and a[rev(i)] only when rev(i) > i to
+     * avoid double-swapping. Not pipelined because random BRAM read-then-write
+     * accesses are not dependency-free across iterations.
+     */
     SUB_BIT_REV:
     for (uint32_t i = 0; i < sub_N; i++) {
 #pragma HLS LOOP_TRIPCOUNT min=4 max=4096
@@ -102,6 +173,17 @@ static void sub_ntt(
         }
     }
 
+    /*
+     * Butterfly stages: sub_logN stages, each doubling the span.
+     * Each (u, v) butterfly pair: u' = u + w*v, v' = u - w*v (mod q).
+     *
+     * DEPENDENCE inter false: tells HLS that iterations of SUB_BFLY do NOT
+     * have true loop-carried dependencies on 'a[]'. This is correct because
+     * at stage s, each iteration reads/writes a disjoint pair (i1, i2), and
+     * adjacent iterations within one group step j by 1 while i2 = i1 + span
+     * — they never alias. Without this pragma HLS conservatively stalls for
+     * BRAM read-after-write, preventing II=1.
+     */
     SUB_STAGE:
     for (uint32_t s = 0; s < sub_logN; s++) {
 #pragma HLS LOOP_TRIPCOUNT min=1 max=12
@@ -115,11 +197,11 @@ static void sub_ntt(
 #pragma HLS LOOP_TRIPCOUNT min=1 max=2048
 #pragma HLS DEPENDENCE variable=a inter false
                 uint32_t i1 = k + j, i2 = i1 + span;
-                ntt_t w = tw[span + j];
+                ntt_t w = tw[span + j];       /* twiddle for this butterfly */
                 ntt_t u = a[i1];
                 ntt_t v = barrett_mod_mul(a[i2], w, q, mu);
-                a[i1] = mod_add(u, v, q);
-                a[i2] = mod_sub(u, v, q);
+                a[i1] = mod_add(u, v, q);     /* butterfly upper output */
+                a[i2] = mod_sub(u, v, q);     /* butterfly lower output */
             }
         }
     }
@@ -134,10 +216,20 @@ void ntt_kernel(
     uint32_t     N,
     uint32_t     logN
 ) {
+    /*
+     * AXI4 master interfaces — three separate bundles so the Zynq interconnect
+     * can issue concurrent DDR transactions on independent channels:
+     *   gmem0: coefficient data (read on input, written on output — in-place)
+     *   gmem1: psi_powers twist table (read in Phase 1; reused as transpose
+     *          scratch in Phase 3, which is why psi_powers is non-const)
+     *   gmem2: twiddle factors (read-only; no write burst needed)
+     * depth= hints guide HLS simulation; burst lengths match DDR page granularity.
+     */
 #pragma HLS INTERFACE m_axi port=data       offset=slave bundle=gmem0 depth=16777216 max_read_burst_length=256 max_write_burst_length=256
 #pragma HLS INTERFACE m_axi port=psi_powers offset=slave bundle=gmem1 depth=1048576  max_read_burst_length=256 max_write_burst_length=256
 #pragma HLS INTERFACE m_axi port=twiddles   offset=slave bundle=gmem2 depth=1048576  max_read_burst_length=256
 
+    /* AXI4-Lite slave: scalar control registers written by the ARM host. */
 #pragma HLS INTERFACE s_axilite port=data
 #pragma HLS INTERFACE s_axilite port=psi_powers
 #pragma HLS INTERFACE s_axilite port=twiddles
@@ -147,26 +239,49 @@ void ntt_kernel(
 #pragma HLS INTERFACE s_axilite port=logN
 #pragma HLS INTERFACE s_axilite port=return
 
+    /*
+     * On-chip working buffers.
+     * tile[]:     holds one batch element's coefficients during processing.
+     *             RAM_T2P (true dual-port) BRAM allows simultaneous read+write
+     *             at different addresses, needed for in-place butterfly swaps.
+     * tw_local[]: cached copy of twiddle factors for the current sub-NTT size.
+     *             LUTRAM (distributed RAM) gives lower latency than block RAM
+     *             for the small random-access twiddle reads during butterflies.
+     */
     ntt_t tile[TILE_N];
     ntt_t tw_local[TILE_N];
 #pragma HLS BIND_STORAGE variable=tile     type=RAM_T2P impl=BRAM
 #pragma HLS BIND_STORAGE variable=tw_local type=RAM_1P  impl=LUTRAM
 
+    /* Precompute Barrett reciprocal once; shared by both execution paths. */
     uint64_t mu = compute_mu(q);
 
     if (N <= TILE_N) {
         /*==============================================================
          * DIRECT PATH: N <= 4096
+         *
+         * The entire coefficient array fits in on-chip BRAM (tile[]).
+         * Both the psi twist table and twiddle table are also cached
+         * on-chip (psi_local[], tw_local[]) so they are fetched from
+         * DDR exactly once and reused across all batch elements.
+         *
+         * Per batch element:
+         *   1. Burst-read data[b*N .. (b+1)*N] from DDR
+         *   2. Multiply by psi_local[i] — negacyclic pre-twist
+         *   3. sub_ntt: bit-reversal + logN butterfly stages (II=1)
+         *   4. Burst-write results back to data[b*N ..]
          *==============================================================*/
         ntt_t psi_local[TILE_N];
 #pragma HLS BIND_STORAGE variable=psi_local type=RAM_1P impl=LUTRAM
 
+        /* Cache psi twist table on-chip — shared across the whole batch. */
         DIRECT_LOAD_PSI:
         for (uint32_t i = 0; i < N; i++) {
 #pragma HLS PIPELINE II=1
 #pragma HLS LOOP_TRIPCOUNT min=256 max=4096
             psi_local[i] = psi_powers[i];
         }
+        /* Cache twiddle table on-chip — shared across the whole batch. */
         DIRECT_LOAD_TW:
         for (uint32_t i = 0; i < N; i++) {
 #pragma HLS PIPELINE II=1
@@ -179,6 +294,9 @@ void ntt_kernel(
 #pragma HLS LOOP_TRIPCOUNT min=1 max=16
             uint32_t base = b * N;
 
+            /* Burst-read one batch element from DDR and apply psi pre-twist.
+             * data[i] *= psi^i converts negacyclic NTT to a standard cyclic NTT
+             * on the twisted input. */
             DIRECT_LOAD:
             for (uint32_t i = 0; i < N; i++) {
 #pragma HLS PIPELINE II=1
@@ -188,6 +306,7 @@ void ntt_kernel(
 
             sub_ntt(tile, tw_local, q, mu, N, logN);
 
+            /* Burst-write transformed coefficients back to DDR in-place. */
             DIRECT_STORE:
             for (uint32_t i = 0; i < N; i++) {
 #pragma HLS PIPELINE II=1
@@ -200,16 +319,30 @@ void ntt_kernel(
         /*==============================================================
          * FOUR-STEP PATH: N > 4096
          *
-         * ALL address arithmetic uses incremental counters.
-         * No "row * N1" or "col * N2" multiplies in any loop body.
+         * N is split as N = N1 * N2 (N1 = 2^floor(logN/2), N2 = 2^ceil(logN/2)).
+         * The N-point coefficient array is treated as an N2 x N1 matrix
+         * stored row-major in DDR. The four-step algorithm then computes
+         * the N-point NTT as:
+         *   Phase 1: psi pre-twist + N1 column NTTs (each N2-point)
+         *   Phase 2: inter-stage twiddle multiply + N2 row NTTs (each N1-point)
+         *   Phase 3: transpose result matrix via DDR scratch buffer
+         *
+         * ALL address arithmetic uses incremental counters ("+= stride").
+         * Expressions like "row*N1+col" synthesize to fabric multipliers
+         * which failed timing at 200 MHz (v7). Incremental counters need
+         * only an adder on the critical path.
          *==============================================================*/
 
         uint32_t logN1 = logN >> 1;
         uint32_t logN2 = logN - logN1;
-        uint32_t N1 = 1u << logN1;
-        uint32_t N2 = 1u << logN2;
+        uint32_t N1 = 1u << logN1;   /* row dimension (number of columns) */
+        uint32_t N2 = 1u << logN2;   /* column dimension (number of rows)  */
 
-        /* ---- Phase 1: Load column twiddles ---- */
+        /*--------------------------------------------------------------
+         * Phase 1: Column NTTs
+         * Twiddle layout: twiddles[0..N2-1] holds the N2-point Stockham
+         * twiddles (omega_2 = omega^N1, the primitive N2-th root of unity).
+         *--------------------------------------------------------------*/
         FS_LOAD_TW_COL:
         for (uint32_t i = 0; i < N2; i++) {
 #pragma HLS PIPELINE II=1
@@ -217,7 +350,6 @@ void ntt_kernel(
             tw_local[i] = twiddles[i];
         }
 
-        /* ---- Phase 1: Psi twist + Column NTTs ---- */
         FS_P1_BATCH:
         for (uint32_t b = 0; b < batch; b++) {
 #pragma HLS LOOP_TRIPCOUNT min=1 max=16
@@ -227,22 +359,27 @@ void ntt_kernel(
             for (uint32_t col = 0; col < N1; col++) {
 #pragma HLS LOOP_TRIPCOUNT min=4 max=4096
 
-                /* Gather column: data[dbase + row*N1 + col] for row=0..N2-1
-                 * Use incremental address: addr starts at dbase+col, increments by N1 */
+                /*
+                 * Strided gather: read column 'col' of the N2 x N1 matrix.
+                 * Element [row][col] lives at DDR offset dbase + row*N1 + col.
+                 * Incrementing gather_addr by N1 each row avoids a multiply.
+                 * Apply negacyclic psi pre-twist during the gather.
+                 */
                 uint32_t gather_addr = dbase + col;
                 FS_GATHER_COL:
                 for (uint32_t row = 0; row < N2; row++) {
 #pragma HLS PIPELINE II=1
 #pragma HLS LOOP_TRIPCOUNT min=4 max=4096
                     ntt_t d = data[gather_addr];
-                    ntt_t p = psi_powers[gather_addr - dbase]; // row*N1+col
+                    ntt_t p = psi_powers[gather_addr - dbase]; /* psi^(row*N1+col) */
                     tile[row] = barrett_mod_mul(d, p, q, mu);
                     gather_addr += N1;
                 }
 
+                /* N2-point NTT on the gathered column, using omega_2 twiddles. */
                 sub_ntt(tile, tw_local, q, mu, N2, logN2);
 
-                /* Scatter column back */
+                /* Scatter transformed column back to the same DDR positions. */
                 uint32_t scatter_addr = dbase + col;
                 FS_SCATTER_COL:
                 for (uint32_t row = 0; row < N2; row++) {
@@ -254,9 +391,16 @@ void ntt_kernel(
             }
         }
 
-        /* ---- Phase 2: Load row twiddles ---- */
+        /*--------------------------------------------------------------
+         * Phase 2: Row NTTs
+         * Twiddle layout: twiddles[N2..N2+N1-1]   — N1-point Stockham twiddles
+         *                 twiddles[N2+N1..N2+N1+N-1] — inter-stage omega^(row*col)
+         * The inter-stage multiply "untwists" the four-step factoring so the
+         * final result equals the full N-point NTT.
+         *--------------------------------------------------------------*/
         uint32_t inter_off = N2 + N1;
 
+        /* Reload tw_local with N1-point twiddles for row NTTs. */
         FS_LOAD_TW_ROW:
         for (uint32_t i = 0; i < N1; i++) {
 #pragma HLS PIPELINE II=1
@@ -264,32 +408,34 @@ void ntt_kernel(
             tw_local[i] = twiddles[N2 + i];
         }
 
-        /* ---- Phase 2+3: Row NTTs + Transpose ---- */
         FS_P23_BATCH:
         for (uint32_t b = 0; b < batch; b++) {
 #pragma HLS LOOP_TRIPCOUNT min=1 max=16
             uint32_t dbase = b * N;
 
-            /* Row NTTs with inter-stage twiddle */
-            uint32_t row_base = dbase;
+            /*
+             * For each row: load the N1 elements, multiply by inter-stage
+             * twiddle omega^(row*col), run an N1-point NTT, write back.
+             * row_base and tw_row_base advance by N1 per iteration — no multiply.
+             */
+            uint32_t row_base    = dbase;
             uint32_t tw_row_base = inter_off;
             FS_ROW_LOOP:
             for (uint32_t row = 0; row < N2; row++) {
 #pragma HLS LOOP_TRIPCOUNT min=4 max=4096
 
-                /* Load row: data[row_base + col] for col=0..N1-1 */
                 FS_LOAD_ROW:
                 for (uint32_t col = 0; col < N1; col++) {
 #pragma HLS PIPELINE II=1
 #pragma HLS LOOP_TRIPCOUNT min=4 max=4096
-                    ntt_t d = data[row_base + col];
-                    ntt_t tw_inter = twiddles[tw_row_base + col];
+                    ntt_t d        = data[row_base + col];
+                    ntt_t tw_inter = twiddles[tw_row_base + col]; /* omega^(row*col) */
                     tile[col] = barrett_mod_mul(d, tw_inter, q, mu);
                 }
 
+                /* N1-point NTT on the current row, using omega_1 twiddles. */
                 sub_ntt(tile, tw_local, q, mu, N1, logN1);
 
-                /* Store row back */
                 FS_STORE_ROW:
                 for (uint32_t col = 0; col < N1; col++) {
 #pragma HLS PIPELINE II=1
@@ -301,24 +447,33 @@ void ntt_kernel(
                 tw_row_base += N1;
             }
 
-            /* Transpose: data[dbase + row*N1 + col] → psi_powers[dbase + col*N2 + row]
+            /*--------------------------------------------------------------
+             * Phase 3: Matrix Transpose via DDR Scratch
              *
-             * Incremental addressing:
-             *   Read:  addr = dbase + row*N1,  stride = 1     (row-major read)
-             *   Write: addr = dbase + row,     stride = N2    (column-major write per tile row)
-             */
+             * After Phases 1+2, data holds the NTT result but in row-major
+             * order of the N2 x N1 matrix. The correct output ordering
+             * requires transposing to N1 x N2 (column-major of the original).
+             *
+             * psi_powers[] is reused as the scratch buffer — it is safe to
+             * overwrite because Phase 1 has already consumed all psi values.
+             *
+             * Read: row-major  (data[dbase + row*N1 + col], stride=1 within row)
+             * Write: column-major into scratch (psi_powers[dbase + col*N2 + row])
+             *        wr_addr starts at dbase+row and steps by N2 per column —
+             *        again avoiding a multiply in the inner loop.
+             *--------------------------------------------------------------*/
             FS_TRANS_TO_SCRATCH:
             for (uint32_t row = 0; row < N2; row++) {
 #pragma HLS LOOP_TRIPCOUNT min=4 max=4096
-                uint32_t rd_addr = dbase + row * N1; // only one multiply per outer iteration
+                /* One multiply per outer iteration (not inner) — acceptable. */
+                uint32_t rd_addr = dbase + row * N1;
                 FS_TRANS_LOAD:
                 for (uint32_t col = 0; col < N1; col++) {
 #pragma HLS PIPELINE II=1
 #pragma HLS LOOP_TRIPCOUNT min=4 max=4096
                     tile[col] = data[rd_addr + col];
                 }
-                /* Write transposed: psi_powers[dbase + col*N2 + row]
-                 * Incremental: start at dbase+row, step by N2 */
+                /* Scatter this row into the transposed column of scratch. */
                 uint32_t wr_addr = dbase + row;
                 FS_TRANS_WRITE_SCRATCH:
                 for (uint32_t col = 0; col < N1; col++) {
@@ -329,7 +484,7 @@ void ntt_kernel(
                 }
             }
 
-            /* Copy scratch back to data (sequential, no multiply) */
+            /* Copy transposed data from scratch back to the output buffer. */
             FS_TRANS_FROM_SCRATCH:
             for (uint32_t i = 0; i < N; i++) {
 #pragma HLS PIPELINE II=1
