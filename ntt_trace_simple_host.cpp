@@ -10,6 +10,8 @@
 
 #include <cstring>
 #include <iostream>
+#include <fstream>
+#include <stdexcept>
 #include <vector>
 #include <cstdint>
 
@@ -246,6 +248,45 @@ int main(int argc, char **argv) {
         for (uint32_t i = 0; i < N; i++) gold[b * N + i] = row[i];
     }
 
+    // ── Write input to file ───────────────────────────────────────────
+    // Simulates what a TCP sender would produce. The file stands in for a
+    // network receive buffer — later this block becomes a socket read.
+    const std::string data_file = "ntt_input.txt";
+    {
+        std::ofstream ofs(data_file);
+        if (!ofs) throw std::runtime_error("Cannot open " + data_file + " for writing");
+
+        // Header: dimensions so the reader can sanity-check before loading.
+        ofs << batch << " " << N << "\n";
+
+        // One coefficient per line, decimal.
+        for (size_t i = 0; i < input.size(); i++)
+            ofs << input[i] << "\n";
+
+        std::cout << "Wrote " << input.size() << " coefficients to " << data_file << "\n";
+    }
+
+    // ── Read input back from file ─────────────────────────────────────
+    // Simulates receiving data from the network. loaded[] is what gets
+    // sent to the FPGA — identical to input[] here, but will come from
+    // the socket in the TCP version.
+    std::vector<uint32_t> loaded(batch * N);
+    {
+        std::ifstream ifs(data_file);
+        if (!ifs) throw std::runtime_error("Cannot open " + data_file + " for reading");
+
+        uint32_t file_batch, file_N;
+        ifs >> file_batch >> file_N;
+        if (file_batch != batch || file_N != N)
+            throw std::runtime_error("File dimensions mismatch: expected batch="
+                + std::to_string(batch) + " N=" + std::to_string(N));
+
+        for (size_t i = 0; i < loaded.size(); i++)
+            ifs >> loaded[i];
+
+        std::cout << "Read " << loaded.size() << " coefficients from " << data_file << "\n";
+    }
+
     // ── Open device and load xclbin ───────────────────────────────────
     std::cout << "Open device 0\n";
     auto device = xrt::device(0);
@@ -275,7 +316,7 @@ int main(int argc, char **argv) {
     auto psi_map  = bo_psi.map<uint32_t *>();
     auto tw_map   = bo_tw.map<uint32_t *>();
 
-    std::memcpy(data_map, input.data(), data_bytes);
+    std::memcpy(data_map, loaded.data(), data_bytes);
 
     // Psi buffer: psi values in [0..N-1]; remainder zeroed (four-step scratch).
     std::fill(psi_map, psi_map + pw, 0u);
