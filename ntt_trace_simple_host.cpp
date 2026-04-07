@@ -13,7 +13,6 @@
 #include <stdexcept>
 #include <vector>
 #include <cstdint>
-#include <chrono>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
@@ -305,31 +304,29 @@ int main(int argc, char **argv) {
         if (conn_fd < 0) { std::cerr << "accept() failed\n"; continue; }
         std::cout << "Client connected\n";
 
-        // ── Receive transform parameters and run count ────────────────
-        uint32_t logN, batch, num_runs;
-        if (!recv_all(conn_fd, &logN,     sizeof(logN))     ||
-            !recv_all(conn_fd, &batch,    sizeof(batch))    ||
-            !recv_all(conn_fd, &num_runs, sizeof(num_runs))) {
+        // ── Receive transform parameters ──────────────────────────────
+        uint32_t logN, batch;
+        if (!recv_all(conn_fd, &logN,  sizeof(logN))  ||
+            !recv_all(conn_fd, &batch, sizeof(batch))) {
             std::cerr << "Failed to receive parameters\n";
             close(conn_fd); continue;
         }
         uint32_t N = 1u << logN;
-        std::cout << "logN=" << logN << "  N=" << N
-                  << "  batch=" << batch << "  runs=" << num_runs << "\n";
+        std::cout << "logN=" << logN << "  N=" << N << "  batch=" << batch << "\n";
 
-        // ── Build NTT tables once for this connection ─────────────────
+        // ── Build NTT tables for this request ─────────────────────────
         uint32_t q   = gen_modulus(N);
         uint32_t psi = find_psi(N, q);
         std::vector<uint32_t> pp, tw;
         make_tables(N, q, psi, pp, tw);
 
-        // ── Send q so client can generate valid coefficients ──────────
+        // ── Send q back so client can generate valid coefficients ─────
         if (!send_all(conn_fd, &q, sizeof(q))) {
             std::cerr << "Failed to send q\n";
             close(conn_fd); continue;
         }
 
-        // ── Allocate FPGA buffers once for this (N, batch) ───────────
+        // ── Allocate FPGA buffers for this N and batch ────────────────
         size_t data_bytes = (size_t)batch * N * sizeof(uint32_t);
         size_t pw         = psi_buf_words(N, batch);
         size_t psi_bytes  = pw * sizeof(uint32_t);
@@ -343,45 +340,33 @@ int main(int argc, char **argv) {
         auto psi_map  = bo_psi.map<uint32_t *>();
         auto tw_map   = bo_tw.map<uint32_t *>();
 
-        // Psi and twiddle tables are identical for every run — fill once.
+        // Pre-fill psi and twiddle buffers (same for every call with this N).
         std::fill(psi_map, psi_map + pw, 0u);
         std::memcpy(psi_map, pp.data(), N * sizeof(uint32_t));
         std::memcpy(tw_map,  tw.data(), tw_bytes);
+
+        // ── Receive input coefficients from client ────────────────────
+        if (!recv_all(conn_fd, data_map, data_bytes)) {
+            std::cerr << "Failed to receive coefficients\n";
+            close(conn_fd); continue;
+        }
+
+        // ── Run FPGA kernel ───────────────────────────────────────────
+        bo_data.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         bo_psi.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         bo_tw.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-        // ── Run loop — one iteration per benchmark run ────────────────
-        for (uint32_t run_i = 0; run_i < num_runs; run_i++) {
+        auto run = krnl(bo_data, bo_psi, bo_tw, q, batch, N, logN);
+        run.wait();
 
-            // Receive fresh input coefficients for this run.
-            if (!recv_all(conn_fd, data_map, data_bytes)) {
-                std::cerr << "Failed to receive coefficients (run " << run_i << ")\n";
-                break;
-            }
+        bo_data.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
-            // Time from DMA-to-device through DMA-from-device.
-            // This captures the full FPGA-side latency seen by the server,
-            // which the client subtracts from its round-trip to isolate
-            // the network transfer overhead.
-            auto t0 = std::chrono::steady_clock::now();
-
-            bo_data.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            auto kern_run = krnl(bo_data, bo_psi, bo_tw, q, batch, N, logN);
-            kern_run.wait();
-            bo_data.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-
-            auto t1  = std::chrono::steady_clock::now();
-            uint64_t fpga_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-
-            // Send results, then send FPGA processing time.
-            if (!send_all(conn_fd, data_map, data_bytes) ||
-                !send_all(conn_fd, &fpga_us, sizeof(fpga_us))) {
-                std::cerr << "Failed to send results (run " << run_i << ")\n";
-                break;
-            }
+        // ── Send results back to client ───────────────────────────────
+        if (!send_all(conn_fd, data_map, data_bytes)) {
+            std::cerr << "Failed to send results\n";
         }
 
         close(conn_fd);
-        std::cout << "Connection complete, waiting for next client\n";
+        std::cout << "Request complete, waiting for next connection\n";
     }
 }
