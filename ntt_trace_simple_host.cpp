@@ -10,10 +10,12 @@
 
 #include <cstring>
 #include <iostream>
-#include <fstream>
 #include <stdexcept>
 #include <vector>
 #include <cstdint>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
 
 // XRT native API — replaces OpenCL entirely
 #include "experimental/xrt_bo.h"
@@ -21,12 +23,11 @@
 #include "experimental/xrt_kernel.h"
 
 // ===================================================================
-// Parameters — edit these to change the transform size and batch
+// Parameters
 // ===================================================================
-static constexpr int      DEF_LOGN  = 10;    /* log2(N): 1024-point transform */
-static constexpr int      DEF_BATCH = 4;     /* independent transforms per run */
-static constexpr int      DEF_BL    = 31;    /* modulus bit-length             */
-static constexpr uint32_t TILE_N    = 4096;  /* direct/four-step threshold     */
+static constexpr int      DEF_BL     = 31;    /* modulus bit-length              */
+static constexpr uint32_t TILE_N     = 4096;  /* direct/four-step threshold      */
+static constexpr int      SERVER_PORT = 54321; /* TCP port to listen on           */
 
 // ===================================================================
 // Modular arithmetic (CPU reference — not optimized)
@@ -215,79 +216,58 @@ static void ref_ntt(std::vector<uint32_t> &a, const std::vector<uint32_t> &pp, u
 }
 
 // ===================================================================
-// Main
+// Socket helpers
 // ===================================================================
+
+/* Receive exactly n bytes — keeps calling recv() until the buffer is full.
+ * TCP is a stream; a single recv() may return fewer bytes than requested. */
+static bool recv_all(int fd, void *buf, size_t n) {
+    char *p = static_cast<char *>(buf);
+    while (n > 0) {
+        ssize_t r = recv(fd, p, n, 0);
+        if (r <= 0) return false;   /* connection closed or error */
+        p += r;
+        n -= r;
+    }
+    return true;
+}
+
+/* Send exactly n bytes — loops until all bytes are flushed into the socket. */
+static bool send_all(int fd, const void *buf, size_t n) {
+    const char *p = static_cast<const char *>(buf);
+    while (n > 0) {
+        ssize_t s = send(fd, p, n, 0);
+        if (s <= 0) return false;
+        p += s;
+        n -= s;
+    }
+    return true;
+}
+
+// ===================================================================
+// Main — TCP server
+// ===================================================================
+//
+// Usage: ./ntt_trace_simple_host <ntt.xclbin> [port]
+//
+// Listens for TCP connections. Each connection follows this protocol:
+//   Client → Server : uint32_t logN, uint32_t batch
+//   Server → Client : uint32_t q            (modulus, so client can verify)
+//   Client → Server : batch*N × uint32_t    (input coefficients)
+//   Server → Client : batch*N × uint32_t    (NTT results)
+//
+// The XRT device and kernel are opened once at startup and reused across
+// all connections — no reload per request.
+
 int main(int argc, char **argv) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <ntt.xclbin>\n";
+        std::cerr << "Usage: " << argv[0] << " <ntt.xclbin> [port]\n";
         return 1;
     }
     std::string xclbin_path = argv[1];
+    int port = (argc >= 3) ? std::stoi(argv[2]) : SERVER_PORT;
 
-    const uint32_t N     = 1u << DEF_LOGN;
-    const uint32_t logN  = DEF_LOGN;
-    const uint32_t batch = DEF_BATCH;
-
-    // ── Generate NTT parameters ──────────────────────────────────────
-    uint32_t q   = gen_modulus(N);
-    uint32_t psi = find_psi(N, q);
-    std::cout << "logN=" << logN << "  N=" << N
-              << "  batch=" << batch << "  q=" << q << "\n";
-
-    std::vector<uint32_t> pp, tw;
-    make_tables(N, q, psi, pp, tw);
-
-    // ── Generate random input & compute CPU reference ─────────────────
-    uint64_t rng = 42;
-    std::vector<uint32_t> input(batch * N), gold(batch * N);
-    for (size_t i = 0; i < input.size(); i++) { input[i] = xrand(rng, q); gold[i] = input[i]; }
-
-    for (uint32_t b = 0; b < batch; b++) {
-        std::vector<uint32_t> row(gold.begin() + b * N, gold.begin() + (b + 1) * N);
-        ref_ntt(row, pp, q);
-        for (uint32_t i = 0; i < N; i++) gold[b * N + i] = row[i];
-    }
-
-    // ── Write input to file ───────────────────────────────────────────
-    // Simulates what a TCP sender would produce. The file stands in for a
-    // network receive buffer — later this block becomes a socket read.
-    const std::string data_file = "ntt_input.txt";
-    {
-        std::ofstream ofs(data_file);
-        if (!ofs) throw std::runtime_error("Cannot open " + data_file + " for writing");
-
-        // Header: dimensions so the reader can sanity-check before loading.
-        ofs << batch << " " << N << "\n";
-
-        // One coefficient per line, decimal.
-        for (size_t i = 0; i < input.size(); i++)
-            ofs << input[i] << "\n";
-
-        std::cout << "Wrote " << input.size() << " coefficients to " << data_file << "\n";
-    }
-
-    // ── Read input back from file ─────────────────────────────────────
-    // Simulates receiving data from the network. loaded[] is what gets
-    // sent to the FPGA — identical to input[] here, but will come from
-    // the socket in the TCP version.
-    std::vector<uint32_t> loaded(batch * N);
-    {
-        std::ifstream ifs(data_file);
-        if (!ifs) throw std::runtime_error("Cannot open " + data_file + " for reading");
-
-        uint32_t file_batch, file_N;
-        ifs >> file_batch >> file_N;
-        if (file_batch != batch || file_N != N)
-            throw std::runtime_error("File dimensions mismatch: expected batch="
-                + std::to_string(batch) + " N=" + std::to_string(N));
-
-        for (size_t i = 0; i < loaded.size(); i++)
-            ifs >> loaded[i];
-
-        std::cout << "Read " << loaded.size() << " coefficients from " << data_file << "\n";
-    }
-
-    // ── Open device and load xclbin ───────────────────────────────────
+    // ── Open XRT device and load xclbin (once) ────────────────────────
     std::cout << "Open device 0\n";
     auto device = xrt::device(0);
 
@@ -295,61 +275,98 @@ int main(int argc, char **argv) {
     auto uuid = device.load_xclbin(xclbin_path);
 
     auto krnl = xrt::kernel(device, uuid, "ntt_kernel");
+    std::cout << "Kernel ready\n";
 
-    // ── Allocate FPGA-side DDR buffers ────────────────────────────────
-    // group_id() maps each buffer to the correct AXI master port in the kernel.
-    //   group_id(0) → gmem0 (data)
-    //   group_id(1) → gmem1 (psi_powers)
-    //   group_id(2) → gmem2 (twiddles)
-    size_t data_bytes = (size_t)batch * N * sizeof(uint32_t);
-    size_t pw         = psi_buf_words(N, batch);
-    size_t psi_bytes  = pw * sizeof(uint32_t);
-    size_t tw_bytes   = tw.size() * sizeof(uint32_t);
+    // ── Create server socket ──────────────────────────────────────────
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) { std::cerr << "socket() failed\n"; return 1; }
 
-    std::cout << "Allocate buffers in global memory\n";
-    auto bo_data = xrt::bo(device, data_bytes, krnl.group_id(0));
-    auto bo_psi  = xrt::bo(device, psi_bytes,  krnl.group_id(1));
-    auto bo_tw   = xrt::bo(device, tw_bytes,   krnl.group_id(2));
+    /* Allow immediate restart after crash without waiting for TIME_WAIT. */
+    int opt = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    // ── Map buffers to host pointers and fill ─────────────────────────
-    auto data_map = bo_data.map<uint32_t *>();
-    auto psi_map  = bo_psi.map<uint32_t *>();
-    auto tw_map   = bo_tw.map<uint32_t *>();
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons(port);
 
-    std::memcpy(data_map, loaded.data(), data_bytes);
+    if (bind(listen_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+        std::cerr << "bind() failed\n"; return 1;
+    }
+    listen(listen_fd, 1);
+    std::cout << "Listening on port " << port << "\n";
 
-    // Psi buffer: psi values in [0..N-1]; remainder zeroed (four-step scratch).
-    std::fill(psi_map, psi_map + pw, 0u);
-    std::memcpy(psi_map, pp.data(), N * sizeof(uint32_t));
+    // ── Accept loop ───────────────────────────────────────────────────
+    while (true) {
+        sockaddr_in client_addr{};
+        socklen_t   client_len = sizeof(client_addr);
+        int conn_fd = accept(listen_fd, reinterpret_cast<sockaddr *>(&client_addr), &client_len);
+        if (conn_fd < 0) { std::cerr << "accept() failed\n"; continue; }
+        std::cout << "Client connected\n";
 
-    std::memcpy(tw_map, tw.data(), tw_bytes);
+        // ── Receive transform parameters ──────────────────────────────
+        uint32_t logN, batch;
+        if (!recv_all(conn_fd, &logN,  sizeof(logN))  ||
+            !recv_all(conn_fd, &batch, sizeof(batch))) {
+            std::cerr << "Failed to receive parameters\n";
+            close(conn_fd); continue;
+        }
+        uint32_t N = 1u << logN;
+        std::cout << "logN=" << logN << "  N=" << N << "  batch=" << batch << "\n";
 
-    // ── DMA host → device ─────────────────────────────────────────────
-    std::cout << "Synchronize input buffers to device\n";
-    bo_data.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    bo_psi.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    bo_tw.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        // ── Build NTT tables for this request ─────────────────────────
+        uint32_t q   = gen_modulus(N);
+        uint32_t psi = find_psi(N, q);
+        std::vector<uint32_t> pp, tw;
+        make_tables(N, q, psi, pp, tw);
 
-    // ── Execute kernel ────────────────────────────────────────────────
-    std::cout << "Execute NTT kernel\n";
-    auto run = krnl(bo_data, bo_psi, bo_tw, q, batch, N, logN);
-    run.wait();
+        // ── Send q back so client can generate valid coefficients ─────
+        if (!send_all(conn_fd, &q, sizeof(q))) {
+            std::cerr << "Failed to send q\n";
+            close(conn_fd); continue;
+        }
 
-    // ── DMA device → host ─────────────────────────────────────────────
-    std::cout << "Read back results\n";
-    bo_data.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        // ── Allocate FPGA buffers for this N and batch ────────────────
+        size_t data_bytes = (size_t)batch * N * sizeof(uint32_t);
+        size_t pw         = psi_buf_words(N, batch);
+        size_t psi_bytes  = pw * sizeof(uint32_t);
+        size_t tw_bytes   = tw.size() * sizeof(uint32_t);
 
-    // ── Verify ───────────────────────────────────────────────────────
-    int mismatches = 0;
-    for (size_t i = 0; i < (size_t)batch * N; i++)
-        if (data_map[i] != gold[i]) mismatches++;
+        auto bo_data = xrt::bo(device, data_bytes, krnl.group_id(0));
+        auto bo_psi  = xrt::bo(device, psi_bytes,  krnl.group_id(1));
+        auto bo_tw   = xrt::bo(device, tw_bytes,   krnl.group_id(2));
 
-    if (mismatches == 0) {
-        std::cout << "TEST PASSED\n";
-        return 0;
-    } else {
-        std::cerr << "TEST FAILED — " << mismatches << "/" << batch * N
-                  << " mismatches\n";
-        return 1;
+        auto data_map = bo_data.map<uint32_t *>();
+        auto psi_map  = bo_psi.map<uint32_t *>();
+        auto tw_map   = bo_tw.map<uint32_t *>();
+
+        // Pre-fill psi and twiddle buffers (same for every call with this N).
+        std::fill(psi_map, psi_map + pw, 0u);
+        std::memcpy(psi_map, pp.data(), N * sizeof(uint32_t));
+        std::memcpy(tw_map,  tw.data(), tw_bytes);
+
+        // ── Receive input coefficients from client ────────────────────
+        if (!recv_all(conn_fd, data_map, data_bytes)) {
+            std::cerr << "Failed to receive coefficients\n";
+            close(conn_fd); continue;
+        }
+
+        // ── Run FPGA kernel ───────────────────────────────────────────
+        bo_data.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bo_psi.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bo_tw.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        auto run = krnl(bo_data, bo_psi, bo_tw, q, batch, N, logN);
+        run.wait();
+
+        bo_data.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+        // ── Send results back to client ───────────────────────────────
+        if (!send_all(conn_fd, data_map, data_bytes)) {
+            std::cerr << "Failed to send results\n";
+        }
+
+        close(conn_fd);
+        std::cout << "Request complete, waiting for next connection\n";
     }
 }
