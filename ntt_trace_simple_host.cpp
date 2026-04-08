@@ -103,7 +103,8 @@ int main(int argc, char **argv) {
         }
         uint32_t N = 1u << logN;
         std::cout << "logN=" << logN << " batch=" << batch
-                  << " q=" << q << " runs=" << num_runs << "\n";
+                  << " q=" << q << " psi_words=" << psi_words
+                  << " tw_words=" << tw_words << " runs=" << num_runs << std::endl;
 
         // ── Allocate XRT buffers for this (N, batch) ──────────────────
         // group_id maps each BO to the correct AXI master port in the kernel:
@@ -128,16 +129,20 @@ int main(int argc, char **argv) {
             std::cerr << "Failed to receive tables\n";
             close(conn_fd); continue;
         }
+        std::cout << "Tables received, syncing to device..." << std::endl;
         bo_psi.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         bo_tw.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        std::cout << "Tables synced, entering run loop" << std::endl;
 
         // ── Run loop ─────────────────────────────────────────────────
         for (uint32_t i = 0; i < num_runs; i++) {
 
             // Receive fresh input coefficients for this run.
+            std::cout << "Run " << i << ": waiting for coefficients..." << std::flush;
             if (!recv_all(conn_fd, data_map, data_bytes)) {
                 std::cerr << "recv coefficients failed (run " << i << ")\n"; break;
             }
+            std::cout << " running kernel..." << std::flush;
 
             // DMA → kernel → DMA, timed for the client's round-trip breakdown.
             auto t0 = std::chrono::steady_clock::now();
@@ -145,6 +150,7 @@ int main(int argc, char **argv) {
             krnl(bo_data, bo_psi, bo_tw, q, batch, N, logN).wait();
             bo_data.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
             auto t1 = std::chrono::steady_clock::now();
+            std::cout << " done" << std::endl;
 
             uint64_t fpga_us = std::chrono::duration_cast<
                 std::chrono::microseconds>(t1 - t0).count();

@@ -273,14 +273,18 @@ int main(int argc, char **argv) {
         uint32_t logN = 10, batch = 1, num_runs = 1, N = 1u << logN;
 
         // Build all NTT tables locally — server receives them, no computation there.
+        std::cout << "[dbg] building tables N=" << N << std::flush;
         uint32_t q   = gen_modulus(N);
         uint32_t psi = find_psi(N, q);
         std::vector<uint32_t> pp, tw;
         make_tables(N, q, psi, pp, tw);
+        std::cout << " q=" << q << " psi_words=" << psi_buf_words(N,batch) << " tw_words=" << tw.size() << std::endl;
 
+        std::cout << "[dbg] sending handshake..." << std::flush;
         if (!send_handshake(sock, logN, batch, num_runs, pp, tw, q)) {
             std::cerr << "Handshake failed\n"; return 1;
         }
+        std::cout << " done" << std::endl;
 
         // Generate input and compute CPU reference.
         uint64_t rng = 42;
@@ -290,11 +294,14 @@ int main(int argc, char **argv) {
         ref_ntt(gold, pp, q);
 
         // Send coefficients, receive results.
+        std::cout << "[dbg] sending " << N << " coefficients..." << std::flush;
         send_all(sock, input.data(), N * sizeof(uint32_t));
+        std::cout << " waiting for results..." << std::flush;
         std::vector<uint32_t> result(N);
         uint64_t fpga_us = 0;
         recv_all(sock, result.data(), N * sizeof(uint32_t));
         recv_all(sock, &fpga_us, sizeof(fpga_us));
+        std::cout << " got them (fpga=" << fpga_us << "us)" << std::endl;
         close(sock);
 
         int mismatches = 0;
