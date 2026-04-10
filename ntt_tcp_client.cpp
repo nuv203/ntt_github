@@ -28,6 +28,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <string>
 #include <vector>
 #include <cstdint>
 #include <arpa/inet.h>
@@ -39,20 +40,29 @@
 // Benchmark configuration
 // ===================================================================
 
-static constexpr int DEF_PORT   = 54321;
-static constexpr int DEF_BL     = 31;
-static constexpr int NUM_RUNS   = 10;   /* timed runs per case   */
-static constexpr int NUM_WARMUP = 2;    /* warm-up runs per case */
+static constexpr int DEF_PORT = 54321;
+static constexpr int DEF_BL   = 31;
 
 struct BenchCase { uint32_t logN; uint32_t batch; };
 
-/* Cases to benchmark — direct path (N≤4096) then four-step (N>4096). */
-static const BenchCase BENCH_CASES[] = {
+/* Default full case list — used when no --suite / --case flags are given. */
+static const BenchCase DEFAULT_CASES[] = {
     { 8,  1}, { 9,  1}, {10,  1}, {11,  1}, {12,  1},   /* direct  */
     {13,  1}, {14,  1}, {15,  1}, {16,  1},               /* 4-step  */
     {10,  4}, {10,  8}, {12,  4},                         /* batched */
 };
-static constexpr int NUM_CASES = sizeof(BENCH_CASES) / sizeof(BENCH_CASES[0]);
+
+/* Predefined suites. */
+static std::vector<BenchCase> suite_cases(const std::string &name) {
+    if (name == "quick")    return {{10,1},{12,1},{14,1}};
+    if (name == "full")     return {{8,1},{9,1},{10,1},{11,1},{12,1},
+                                    {13,1},{14,1},{15,1},{16,1},
+                                    {10,4},{10,8},{12,4}};
+    if (name == "direct")   return {{8,1},{9,1},{10,1},{11,1},{12,1}};
+    if (name == "fourstep") return {{13,1},{14,1},{15,1},{16,1}};
+    if (name == "batched")  return {{10,4},{10,8},{12,4},{14,2}};
+    return {}; /* empty = unknown */
+}
 
 static constexpr uint32_t TILE_N = 4096;
 
@@ -257,12 +267,65 @@ static Stats compute_stats(std::vector<double> &v) {
 // ===================================================================
 // Main
 // ===================================================================
+static void print_usage(const char *prog) {
+    std::cerr
+        << "Usage: " << prog << " <server-ip> [port]\n"
+        << "           [--suite <name>]        predefined case list (repeatable)\n"
+        << "           [--case <logN>:<batch>] individual case (repeatable)\n"
+        << "           [--runs  <N>]           timed iterations (default 10)\n"
+        << "           [--warmup <N>]          warmup iterations (default 2)\n"
+        << "\n"
+        << "Suites: quick, full, direct, fourstep, batched\n";
+}
+
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <server-ip> [port]\n"; return 1;
+    if (argc < 2) { print_usage(argv[0]); return 1; }
+
+    const char *server_ip = nullptr;
+    int         port      = DEF_PORT;
+    int         num_runs  = 10;
+    int         num_warmup = 2;
+    std::vector<BenchCase> bench_cases;
+
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--suite") {
+            if (i + 1 >= argc) { std::cerr << "--suite requires a name\n"; return 1; }
+            std::string name = argv[++i];
+            auto cases = suite_cases(name);
+            if (cases.empty()) {
+                std::cerr << "Unknown suite '" << name << "'. Valid: quick, full, direct, fourstep, batched\n";
+                return 1;
+            }
+            bench_cases.insert(bench_cases.end(), cases.begin(), cases.end());
+        } else if (arg == "--case") {
+            if (i + 1 >= argc) { std::cerr << "--case requires logN:batch\n"; return 1; }
+            uint32_t ln, bt;
+            if (sscanf(argv[++i], "%u:%u", &ln, &bt) != 2) {
+                std::cerr << "Invalid --case format '" << argv[i] << "', expected logN:batch\n"; return 1;
+            }
+            bench_cases.push_back({ln, bt});
+        } else if (arg == "--runs") {
+            if (i + 1 >= argc) { std::cerr << "--runs requires a number\n"; return 1; }
+            num_runs = std::stoi(argv[++i]);
+        } else if (arg == "--warmup") {
+            if (i + 1 >= argc) { std::cerr << "--warmup requires a number\n"; return 1; }
+            num_warmup = std::stoi(argv[++i]);
+        } else if (arg[0] == '-') {
+            std::cerr << "Unknown flag '" << arg << "'\n"; print_usage(argv[0]); return 1;
+        } else if (!server_ip) {
+            server_ip = argv[i];
+        } else {
+            port = std::stoi(argv[i]);
+        }
     }
-    const char *server_ip = argv[1];
-    int         port      = (argc >= 3) ? std::stoi(argv[2]) : DEF_PORT;
+
+    if (!server_ip) { print_usage(argv[0]); return 1; }
+
+    /* Default: run the full case list if nothing was specified. */
+    if (bench_cases.empty()) {
+        bench_cases.assign(std::begin(DEFAULT_CASES), std::end(DEFAULT_CASES));
+    }
 
     // ── Correctness check (logN=10, batch=1, 1 run) ──────────────────
     std::cout << "=== Correctness check (logN=10, batch=1) ===\n";
@@ -313,8 +376,8 @@ int main(int argc, char **argv) {
     }
 
     // ── Benchmark loop ────────────────────────────────────────────────
-    std::cout << "=== Benchmark (" << NUM_RUNS << " runs, "
-              << NUM_WARMUP << " warmup) ===\n\n";
+    std::cout << "=== Benchmark (" << num_runs << " runs, "
+              << num_warmup << " warmup) ===\n\n";
 
     std::cout
         << std::left
@@ -328,11 +391,11 @@ int main(int argc, char **argv) {
         << "\n"
         << std::string(79, '-') << "\n";
 
-    for (int ci = 0; ci < NUM_CASES; ci++) {
-        uint32_t logN      = BENCH_CASES[ci].logN;
-        uint32_t batch     = BENCH_CASES[ci].batch;
+    for (const auto &bc : bench_cases) {
+        uint32_t logN      = bc.logN;
+        uint32_t batch     = bc.batch;
         uint32_t N         = 1u << logN;
-        uint32_t total_runs = NUM_WARMUP + NUM_RUNS;
+        uint32_t total_runs = (uint32_t)(num_warmup + num_runs);
 
         // One connection per benchmark case — all runs share the connection.
         int sock = connect_to(server_ip, port);
@@ -359,9 +422,9 @@ int main(int argc, char **argv) {
         std::vector<uint32_t> result(batch * N);
 
         std::vector<double> rtt_us, fpga_us_v, net_us_v;
-        rtt_us.reserve(NUM_RUNS);
-        fpga_us_v.reserve(NUM_RUNS);
-        net_us_v.reserve(NUM_RUNS);
+        rtt_us.reserve(num_runs);
+        fpga_us_v.reserve(num_runs);
+        net_us_v.reserve(num_runs);
 
         for (uint32_t r = 0; r < total_runs; r++) {
             auto t0 = std::chrono::steady_clock::now();
@@ -375,7 +438,7 @@ int main(int argc, char **argv) {
             auto t1 = std::chrono::steady_clock::now();
             double rtt = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
 
-            if (r >= (uint32_t)NUM_WARMUP) {
+            if (r >= (uint32_t)num_warmup) {
                 rtt_us.push_back(rtt);
                 fpga_us_v.push_back((double)fpga_us);
                 net_us_v.push_back(rtt - (double)fpga_us);
