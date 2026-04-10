@@ -333,7 +333,8 @@ int main(int argc, char **argv) {
         int sock = connect_to(server_ip, port);
         if (sock < 0) { std::cerr << "connect() failed\n"; return 1; }
 
-        uint32_t logN = 10, batch = 1, num_runs = 1, N = 1u << logN;
+        uint32_t logN = 10, batch = 1, N = 1u << logN;
+        uint32_t check_runs = 1;
 
         // Build all NTT tables locally — server receives them, no computation there.
         std::cout << "[dbg] building tables N=" << N << std::flush;
@@ -344,7 +345,7 @@ int main(int argc, char **argv) {
         std::cout << " q=" << q << " psi_words=" << psi_buf_words(N,batch) << " tw_words=" << tw.size() << std::endl;
 
         std::cout << "[dbg] sending handshake..." << std::flush;
-        if (!send_handshake(sock, logN, batch, num_runs, pp, tw, q)) {
+        if (!send_handshake(sock, logN, batch, check_runs, pp, tw, q)) {
             std::cerr << "Handshake failed\n"; return 1;
         }
         std::cout << " done" << std::endl;
@@ -356,22 +357,29 @@ int main(int argc, char **argv) {
         std::vector<uint32_t> gold(input);
         ref_ntt(gold, pp, q);
 
-        // Send coefficients, receive results.
+        // Send coefficients, receive results — measure full round-trip.
         std::cout << "[dbg] sending " << N << " coefficients..." << std::flush;
+        auto t0 = std::chrono::steady_clock::now();
         send_all(sock, input.data(), N * sizeof(uint32_t));
         std::cout << " waiting for results..." << std::flush;
         std::vector<uint32_t> result(N);
         uint64_t fpga_us = 0;
         recv_all(sock, result.data(), N * sizeof(uint32_t));
         recv_all(sock, &fpga_us, sizeof(fpga_us));
-        std::cout << " got them (fpga=" << fpga_us << "us)" << std::endl;
+        auto t1 = std::chrono::steady_clock::now();
         close(sock);
+
+        double rtt_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        double net_us = rtt_us - (double)fpga_us;
+        std::cout << " done\n"
+                  << "  round_trip=" << rtt_us/1000.0 << "ms"
+                  << "  fpga="       << fpga_us/1000.0 << "ms"
+                  << "  net_io="     << net_us/1000.0  << "ms\n";
 
         int mismatches = 0;
         for (uint32_t i = 0; i < N; i++) if (result[i] != gold[i]) mismatches++;
         std::cout << (mismatches == 0 ? "PASSED" : "FAILED")
-                  << " (" << mismatches << " mismatches, FPGA took "
-                  << fpga_us << " us)\n\n";
+                  << " (" << mismatches << " mismatches)\n\n";
         if (mismatches) return 1;
     }
 

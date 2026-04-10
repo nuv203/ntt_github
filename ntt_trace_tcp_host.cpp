@@ -135,6 +135,9 @@ int main(int argc, char **argv) {
         std::cout << "Tables synced, entering run loop" << std::endl;
 
         // ── Run loop ─────────────────────────────────────────────────
+        uint64_t total_fpga_us = 0;
+        uint32_t completed = 0;
+
         for (uint32_t i = 0; i < num_runs; i++) {
 
             // Receive fresh input coefficients for this run.
@@ -142,26 +145,38 @@ int main(int argc, char **argv) {
             if (!recv_all(conn_fd, data_map, data_bytes)) {
                 std::cerr << "recv coefficients failed (run " << i << ")\n"; break;
             }
-            std::cout << " running kernel..." << std::flush;
 
-            // DMA → kernel → DMA, timed for the client's round-trip breakdown.
+            // DMA host→device, kernel execution, DMA device→host.
+            // This is the time the server spends on the FPGA side — reported
+            // back to the client so it can isolate fpga time from network I/O.
             auto t0 = std::chrono::steady_clock::now();
             bo_data.sync(XCL_BO_SYNC_BO_TO_DEVICE);
             krnl(bo_data, bo_psi, bo_tw, q, batch, N, logN).wait();
             bo_data.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
             auto t1 = std::chrono::steady_clock::now();
-            std::cout << " done" << std::endl;
 
             uint64_t fpga_us = std::chrono::duration_cast<
                 std::chrono::microseconds>(t1 - t0).count();
+
+            std::cout << " fpga=" << fpga_us << "us" << std::endl;
 
             if (!send_all(conn_fd, data_map, data_bytes) ||
                 !send_all(conn_fd, &fpga_us, sizeof(fpga_us))) {
                 std::cerr << "send results failed (run " << i << ")\n"; break;
             }
+
+            total_fpga_us += fpga_us;
+            completed++;
         }
 
         close(conn_fd);
-        std::cout << "Connection complete\n";
+
+        if (completed > 0) {
+            std::cout << "Connection complete: " << completed << " runs, "
+                      << "avg fpga=" << total_fpga_us / completed << "us, "
+                      << "total fpga=" << total_fpga_us / 1000 << "ms\n";
+        } else {
+            std::cout << "Connection complete (no runs finished)\n";
+        }
     }
 }
