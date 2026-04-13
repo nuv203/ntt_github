@@ -274,6 +274,7 @@ static void print_usage(const char *prog) {
         << "           [--case <logN>:<batch>] individual case (repeatable)\n"
         << "           [--runs  <N>]           timed iterations (default 10)\n"
         << "           [--warmup <N>]          warmup iterations (default 2)\n"
+        << "           [--serial]              disable pipelined sends (default: pipelined)\n"
         << "\n"
         << "Suites: quick, full, direct, fourstep, batched\n";
 }
@@ -282,9 +283,10 @@ int main(int argc, char **argv) {
     if (argc < 2) { print_usage(argv[0]); return 1; }
 
     const char *server_ip = nullptr;
-    int         port      = DEF_PORT;
-    int         num_runs  = 10;
+    int         port       = DEF_PORT;
+    int         num_runs   = 10;
     int         num_warmup = 2;
+    bool        serial     = false;
     std::vector<BenchCase> bench_cases;
 
     for (int i = 1; i < argc; i++) {
@@ -311,6 +313,8 @@ int main(int argc, char **argv) {
         } else if (arg == "--warmup") {
             if (i + 1 >= argc) { std::cerr << "--warmup requires a number\n"; return 1; }
             num_warmup = std::stoi(argv[++i]);
+        } else if (arg == "--serial") {
+            serial = true;
         } else if (arg[0] == '-') {
             std::cerr << "Unknown flag '" << arg << "'\n"; print_usage(argv[0]); return 1;
         } else if (!server_ip) {
@@ -385,7 +389,8 @@ int main(int argc, char **argv) {
 
     // ── Benchmark loop ────────────────────────────────────────────────
     std::cout << "=== Benchmark (" << num_runs << " runs, "
-              << num_warmup << " warmup) ===\n\n";
+              << num_warmup << " warmup, "
+              << (serial ? "serial" : "pipelined") << ") ===\n\n";
 
     std::cout
         << std::left
@@ -434,22 +439,69 @@ int main(int argc, char **argv) {
         fpga_us_v.reserve(num_runs);
         net_us_v.reserve(num_runs);
 
-        for (uint32_t r = 0; r < total_runs; r++) {
+        /* Helper: send one run's input and receive result + fpga_us. */
+        auto do_recv = [&](uint64_t &fpga_us_out) -> bool {
+            fpga_us_out = 0;
+            return recv_all(sock, result.data(), data_bytes) &&
+                   recv_all(sock, &fpga_us_out, sizeof(fpga_us_out));
+        };
+
+        if (serial) {
+            /* Serial: one full round-trip per run — baseline mode. */
+            for (uint32_t r = 0; r < total_runs; r++) {
+                auto t0 = std::chrono::steady_clock::now();
+                send_all(sock, input.data(), data_bytes);
+                uint64_t fpga_us = 0;
+                do_recv(fpga_us);
+                auto t1 = std::chrono::steady_clock::now();
+                double rtt = std::chrono::duration_cast<
+                    std::chrono::microseconds>(t1 - t0).count();
+                if (r >= (uint32_t)num_warmup) {
+                    rtt_us.push_back(rtt);
+                    fpga_us_v.push_back((double)fpga_us);
+                    net_us_v.push_back(rtt - (double)fpga_us);
+                }
+            }
+        } else {
+            /*
+             * Pipelined: send run N+1 while waiting for run N's result.
+             * Depth-1 pipeline eliminates the idle gap between each kernel
+             * call without risking TCP buffer deadlock (at most 2 runs'
+             * worth of data in flight at any time).
+             *
+             * Timing: the timed phase is bracketed by t0/t1 so we get
+             * total elapsed time for all num_runs timed iterations.
+             * Per-run fpga_us is still reported by the server each run.
+             */
+
+            /* Warmup phase — send, pipeline recv, discard. */
+            if (num_warmup > 0) {
+                send_all(sock, input.data(), data_bytes);
+                for (int r = 1; r < num_warmup; r++) {
+                    send_all(sock, input.data(), data_bytes); /* pre-send next */
+                    uint64_t discard = 0; do_recv(discard);
+                }
+                uint64_t discard = 0; do_recv(discard);      /* drain last warmup */
+            }
+
+            /* Timed phase. */
             auto t0 = std::chrono::steady_clock::now();
-
-            send_all(sock, input.data(), data_bytes);
-
-            uint64_t fpga_us = 0;
-            recv_all(sock, result.data(), data_bytes);
-            recv_all(sock, &fpga_us, sizeof(fpga_us));
-
-            auto t1 = std::chrono::steady_clock::now();
-            double rtt = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-
-            if (r >= (uint32_t)num_warmup) {
-                rtt_us.push_back(rtt);
+            send_all(sock, input.data(), data_bytes);         /* prime the pipeline */
+            for (int r = 1; r < num_runs; r++) {
+                send_all(sock, input.data(), data_bytes);     /* pre-send run r */
+                uint64_t fpga_us = 0; do_recv(fpga_us);      /* recv run r-1 */
                 fpga_us_v.push_back((double)fpga_us);
-                net_us_v.push_back(rtt - (double)fpga_us);
+            }
+            uint64_t fpga_us = 0; do_recv(fpga_us);          /* drain last run */
+            auto t1 = std::chrono::steady_clock::now();
+            fpga_us_v.push_back((double)fpga_us);
+
+            /* Distribute total elapsed time evenly across timed runs. */
+            double avg_rtt = std::chrono::duration_cast<std::chrono::microseconds>(
+                t1 - t0).count() / (double)num_runs;
+            for (int r = 0; r < num_runs; r++) {
+                rtt_us.push_back(avg_rtt);
+                net_us_v.push_back(avg_rtt - fpga_us_v[r]);
             }
         }
         close(sock);

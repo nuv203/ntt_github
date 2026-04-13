@@ -1,4 +1,0 @@
-domain_path: /home/nuv203/ssd/kria_xrt_testing/kria_plat/zynqmp_fsbl/zynqmp_fsbl_bsp
-app_src_dir: /home/nuv203/ssd/Xilinx/Vitis/2024.2/data/embeddedsw/lib/sw_apps/zynqmp_fsbl
-template: zynqmp_fsbl
-lang: c
