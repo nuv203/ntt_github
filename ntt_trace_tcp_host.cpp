@@ -1,20 +1,22 @@
 /*
- * ntt_trace_simple_host.cpp — NTT FPGA TCP server
+ * ntt_trace_tcp_host.cpp — NTT FPGA TCP server
  *
- * Pure forwarder: no NTT math, no table generation.
- * Receives pre-built buffers from the client, pushes them to the FPGA
- * via XRT, and sends the results back. The client owns all computation.
+ * Receives pre-built tables from the client and processes each run either via
+ * the FPGA accelerator (mode=0) or the Kria ARM CPU (mode=1). The CPU path
+ * enables a direct FPGA-vs-ARM comparison with identical data and network costs.
  *
- * Usage: ./ntt_trace_simple_host <ntt.xclbin> [port]
+ * Usage: ./ntt_trace_tcp_host <ntt.xclbin> [port]
  *
  * Protocol (per connection):
- *   Client → Server : uint32_t logN, batch, q, psi_words, tw_words, num_runs
+ *   Client → Server : uint32_t logN, batch, q, psi_words, tw_words, num_runs, mode
+ *                       mode 0 = FPGA accelerator
+ *                       mode 1 = Kria ARM CPU (software NTT)
  *   Client → Server : psi_words × uint32_t   (psi_powers table)
  *   Client → Server : tw_words  × uint32_t   (twiddle table)
  *   [loop num_runs:]
  *     Client → Server : batch*N × uint32_t   (input coefficients)
  *     Server → Client : batch*N × uint32_t   (NTT results)
- *     Server → Client : uint64_t             (FPGA processing time in µs)
+ *     Server → Client : uint64_t             (processing time in µs)
  */
 
 #include <chrono>
@@ -32,9 +34,77 @@
 
 static constexpr int SERVER_PORT = 54321;
 
+// ── CPU NTT helpers (used only in mode=1) ────────────────────────────────────
+
+static inline uint32_t cpu_mod_mul(uint32_t a, uint32_t b, uint32_t q) {
+    return (uint32_t)(((uint64_t)a * b) % q);
+}
+static inline uint32_t cpu_mod_add(uint32_t a, uint32_t b, uint32_t q) {
+    uint32_t s = a + b; return s >= q ? s - q : s;
+}
+static inline uint32_t cpu_mod_sub(uint32_t a, uint32_t b, uint32_t q) {
+    return a >= b ? a - b : a + q - b;
+}
+static uint32_t cpu_power_mod(uint32_t base, uint32_t exp, uint32_t mod) {
+    uint64_t r = 1, b = base;
+    while (exp > 0) {
+        if (exp & 1) r = (r * b) % mod;
+        b = (b * b) % mod;
+        exp >>= 1;
+    }
+    return (uint32_t)r;
+}
+
+/*
+ * Software negacyclic NTT — matches ref_ntt on the client exactly.
+ *
+ * Uses the received psi_map for the psi-powers twist (psi_map[i] = psi^i).
+ * Derives omega = psi^2 from psi_map[1] and computes twiddles on the fly so
+ * it works for all N, including four-step sizes (N > TILE_N).
+ *
+ * Algorithm: psi twist → bit-reversal → Cooley-Tukey DIT butterfly.
+ */
+static void cpu_ntt_forward(uint32_t *data, const uint32_t *psi_map,
+                            uint32_t q, uint32_t batch,
+                            uint32_t N, uint32_t logN) {
+    uint32_t omega = cpu_mod_mul(psi_map[1], psi_map[1], q);  // omega = psi^2
+
+    for (uint32_t b = 0; b < batch; b++) {
+        uint32_t *a = data + (size_t)b * N;
+
+        // Step 1: psi twist — a[i] *= psi^i
+        for (uint32_t i = 0; i < N; i++)
+            a[i] = cpu_mod_mul(a[i], psi_map[i], q);
+
+        // Step 2: bit-reversal permutation
+        for (uint32_t i = 0; i < N; i++) {
+            uint32_t j = 0, x = i;
+            for (uint32_t k = 0; k < logN; k++) { j = (j << 1) | (x & 1); x >>= 1; }
+            if (j > i) { uint32_t tmp = a[i]; a[i] = a[j]; a[j] = tmp; }
+        }
+
+        // Step 3: Cooley-Tukey DIT butterfly stages
+        for (uint32_t s = 0; s < logN; s++) {
+            uint32_t span  = 1u << s;
+            uint32_t span2 = span << 1;
+            // Root for this stage: omega^(N / (2*span))
+            uint32_t ws = cpu_power_mod(omega, N / span2, q);
+            for (uint32_t k = 0; k < N; k += span2) {
+                uint32_t w = 1;
+                for (uint32_t j = 0; j < span; j++) {
+                    uint32_t u = a[k + j];
+                    uint32_t v = cpu_mod_mul(a[k + j + span], w, q);
+                    a[k + j]        = cpu_mod_add(u, v, q);
+                    a[k + j + span] = cpu_mod_sub(u, v, q);
+                    w = cpu_mod_mul(w, ws, q);
+                }
+            }
+        }
+    }
+}
+
 // ── Socket helpers ────────────────────────────────────────────────────────────
 
-/* Receive exactly n bytes, looping over partial reads (TCP is a stream). */
 static bool recv_all(int fd, void *buf, size_t n) {
     char *p = static_cast<char *>(buf);
     while (n > 0) {
@@ -45,7 +115,6 @@ static bool recv_all(int fd, void *buf, size_t n) {
     return true;
 }
 
-/* Send exactly n bytes, looping over partial writes. */
 static bool send_all(int fd, const void *buf, size_t n) {
     const char *p = static_cast<const char *>(buf);
     while (n > 0) {
@@ -91,26 +160,28 @@ int main(int argc, char **argv) {
         std::cout << "Client connected\n";
 
         // ── Receive connection parameters ─────────────────────────────
-        uint32_t logN, batch, q, psi_words, tw_words, num_runs;
+        uint32_t logN, batch, q, psi_words, tw_words, num_runs, mode;
         if (!recv_all(conn_fd, &logN,      sizeof(logN))      ||
             !recv_all(conn_fd, &batch,     sizeof(batch))     ||
             !recv_all(conn_fd, &q,         sizeof(q))         ||
             !recv_all(conn_fd, &psi_words, sizeof(psi_words)) ||
             !recv_all(conn_fd, &tw_words,  sizeof(tw_words))  ||
-            !recv_all(conn_fd, &num_runs,  sizeof(num_runs))) {
+            !recv_all(conn_fd, &num_runs,  sizeof(num_runs))  ||
+            !recv_all(conn_fd, &mode,      sizeof(mode))) {
             std::cerr << "Failed to receive parameters\n";
             close(conn_fd); continue;
         }
         uint32_t N = 1u << logN;
         std::cout << "logN=" << logN << " batch=" << batch
                   << " q=" << q << " psi_words=" << psi_words
-                  << " tw_words=" << tw_words << " runs=" << num_runs << std::endl;
+                  << " tw_words=" << tw_words << " runs=" << num_runs
+                  << " mode=" << (mode == 0 ? "FPGA" : "ARM-CPU") << std::endl;
 
-        // ── Allocate XRT buffers for this (N, batch) ──────────────────
-        // group_id maps each BO to the correct AXI master port in the kernel:
+        // ── Allocate XRT buffers (used for FPGA mode; host-accessible for CPU mode) ──
+        // group_id maps each BO to the correct AXI master port:
         //   group_id(0) → gmem0 → data       (in/out)
-        //   group_id(1) → gmem1 → psi_powers (in, reused as scratch for N>4096)
-        //   group_id(2) → gmem2 → twiddles   (in, read-only)
+        //   group_id(1) → gmem1 → psi_powers
+        //   group_id(2) → gmem2 → twiddles
         size_t data_bytes = (size_t)batch * N * sizeof(uint32_t);
         size_t psi_bytes  = (size_t)psi_words * sizeof(uint32_t);
         size_t tw_bytes   = (size_t)tw_words  * sizeof(uint32_t);
@@ -129,54 +200,53 @@ int main(int argc, char **argv) {
             std::cerr << "Failed to receive tables\n";
             close(conn_fd); continue;
         }
-        std::cout << "Tables received, syncing to device..." << std::endl;
-        bo_psi.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        bo_tw.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        std::cout << "Tables synced, entering run loop" << std::endl;
 
-        // ── Run loop ─────────────────────────────────────────────────
-        uint64_t total_fpga_us = 0;
+        // Sync tables to FPGA only when needed.
+        if (mode == 0) {
+            bo_psi.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            bo_tw.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+        std::cout << "Tables ready, entering run loop\n";
+
+        // ── Run loop ──────────────────────────────────────────────────
+        uint64_t total_proc_us = 0;
         uint32_t completed = 0;
 
         for (uint32_t i = 0; i < num_runs; i++) {
-
-            // Receive fresh input coefficients for this run.
-            std::cout << "Run " << i << ": waiting for coefficients..." << std::flush;
             if (!recv_all(conn_fd, data_map, data_bytes)) {
                 std::cerr << "recv coefficients failed (run " << i << ")\n"; break;
             }
 
-            // DMA host→device, kernel execution, DMA device→host.
-            // This is the time the server spends on the FPGA side — reported
-            // back to the client so it can isolate fpga time from network I/O.
             auto t0 = std::chrono::steady_clock::now();
-            bo_data.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            krnl(bo_data, bo_psi, bo_tw, q, batch, N, logN).wait();
-            bo_data.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-            auto t1 = std::chrono::steady_clock::now();
 
-            uint64_t fpga_us = std::chrono::duration_cast<
+            if (mode == 0) {
+                // FPGA path: DMA → kernel → DMA
+                bo_data.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                krnl(bo_data, bo_psi, bo_tw, q, batch, N, logN).wait();
+                bo_data.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            } else {
+                // CPU path: software NTT on Kria ARM, operates directly on data_map
+                cpu_ntt_forward(data_map, psi_map, q, batch, N, logN);
+            }
+
+            auto t1 = std::chrono::steady_clock::now();
+            uint64_t proc_us = std::chrono::duration_cast<
                 std::chrono::microseconds>(t1 - t0).count();
 
-            std::cout << " fpga=" << fpga_us << "us" << std::endl;
-
             if (!send_all(conn_fd, data_map, data_bytes) ||
-                !send_all(conn_fd, &fpga_us, sizeof(fpga_us))) {
+                !send_all(conn_fd, &proc_us, sizeof(proc_us))) {
                 std::cerr << "send results failed (run " << i << ")\n"; break;
             }
 
-            total_fpga_us += fpga_us;
+            total_proc_us += proc_us;
             completed++;
         }
 
         close(conn_fd);
-
         if (completed > 0) {
-            std::cout << "Connection complete: " << completed << " runs, "
-                      << "avg fpga=" << total_fpga_us / completed << "us, "
-                      << "total fpga=" << total_fpga_us / 1000 << "ms\n";
-        } else {
-            std::cout << "Connection complete (no runs finished)\n";
+            std::cout << "Done: " << completed << " runs, avg "
+                      << (mode == 0 ? "fpga=" : "arm=")
+                      << total_proc_us / completed << "us\n";
         }
     }
 }
