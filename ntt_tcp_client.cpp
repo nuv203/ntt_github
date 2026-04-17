@@ -625,18 +625,19 @@ static void run_he_benchmark(const char *server_ip, int port) {
     static constexpr uint32_t HE_TOTAL = NUM_WARMUP + NUM_RUNS;
 
     // Print header
-    std::cout << std::left
-              << std::setw(6)  << " logN"
-              << std::setw(8)  << "      N"
-              << std::setw(7)  << "  batch"
-              << std::setw(14) << "  FPGA NTT(ms)"
-              << std::setw(13) << "  ARM NTT(ms)"
-              << std::setw(10) << "  Speedup"
-              << std::setw(17) << "  INTT+ptwise(ms)"
-              << std::setw(15) << "  Full FPGA(ms)"
-              << std::setw(14) << "  Full ARM(ms)"
+    // Columns: logN(5) N(7) batch(6) | FPGA NTT(12) ARM NTT(12) INTT+ptwise(14) Full FPGA(12) Full ARM(12) Speedup(9)
+    std::cout << std::right
+              << std::setw(5)  << "logN"  << " "
+              << std::setw(7)  << "N"     << " "
+              << std::setw(6)  << "batch" << " "
+              << std::setw(12) << "FPGA NTT(ms)" << " "
+              << std::setw(12) << "ARM NTT(ms)"  << " "
+              << std::setw(14) << "INTT+ptwise(ms)" << " "
+              << std::setw(12) << "Full FPGA(ms)"   << " "
+              << std::setw(12) << "Full ARM(ms)"    << " "
+              << std::setw(8)  << "Speedup"
               << "\n"
-              << std::string(104, '-') << "\n";
+              << std::string(103, '-') << "\n";
 
     for (int ci = 0; ci < NUM_HE_CASES; ci++) {
         uint32_t logN  = HE_CASES[ci].logN;
@@ -714,16 +715,16 @@ static void run_he_benchmark(const char *server_ip, int port) {
         double arm_full  = arm_s.median_us  + client_s.median_us;
         double speedup   = (fpga_s.median_us > 0) ? arm_s.median_us / fpga_s.median_us : 0.0;
 
-        std::cout << std::fixed
+        std::cout << std::fixed << std::setprecision(3)
                   << std::right << std::setw(5)  << logN  << " "
                   << std::right << std::setw(7)  << N     << " "
                   << std::right << std::setw(6)  << batch << " "
-                  << std::right << std::setw(13) << std::setprecision(3) << fpga_s.median_us / 1000.0 << " "
+                  << std::right << std::setw(12) << fpga_s.median_us / 1000.0 << " "
                   << std::right << std::setw(12) << arm_s.median_us  / 1000.0 << " "
-                  << std::right << std::setw(8)  << std::setprecision(1) << speedup << "x "
-                  << std::right << std::setw(16) << std::setprecision(3) << client_s.median_us / 1000.0 << " "
-                  << std::right << std::setw(14) << fpga_full / 1000.0 << " "
-                  << std::right << std::setw(13) << arm_full  / 1000.0
+                  << std::right << std::setw(14) << client_s.median_us / 1000.0 << " "
+                  << std::right << std::setw(12) << fpga_full / 1000.0 << " "
+                  << std::right << std::setw(12) << arm_full  / 1000.0 << " "
+                  << std::right << std::setw(7)  << std::setprecision(1) << speedup << "x"
                   << "\n";
     }
 }
@@ -737,6 +738,26 @@ int main(int argc, char **argv) {
     }
     const char *server_ip = argv[1];
     int         port      = (argc >= 3) ? std::stoi(argv[2]) : DEF_PORT;
+
+    // ── Silent warmup — open and close a connection so the first real
+    //    benchmark run doesn't pay the cold-path TCP/FPGA setup cost.
+    {
+        int sock = connect_to(server_ip, port);
+        if (sock >= 0) {
+            uint32_t logN = 8, batch = 1, num_runs = 1, N = 1u << logN;
+            uint32_t q = gen_modulus(N), psi = find_psi(N, q);
+            std::vector<uint32_t> pp, tw;
+            make_tables(N, q, psi, pp, tw);
+            if (send_handshake(sock, logN, batch, num_runs, 0, pp, tw, q)) {
+                std::vector<uint32_t> buf(N, 1);
+                uint64_t dummy = 0;
+                send_all(sock, buf.data(), N * sizeof(uint32_t));
+                recv_all(sock, buf.data(), N * sizeof(uint32_t));
+                recv_all(sock, &dummy, sizeof(dummy));
+            }
+            close(sock);
+        }
+    }
 
     // ── Correctness check (logN=10, batch=1, 1 run) ──────────────────
     std::cout << "=== Correctness check (logN=10, batch=1) ===\n";
@@ -798,16 +819,15 @@ int main(int argc, char **argv) {
               << NUM_WARMUP << " warmup) ===\n\n";
 
     std::cout
-        << std::left
-        << std::setw(7)  << "logN"
-        << std::setw(9)  << "N"
-        << std::setw(7)  << "batch"
-        << std::setw(16) << "round_trip(ms)"
-        << std::setw(14) << "fpga(ms)"
-        << std::setw(14) << "net_io(ms)"
-        << std::setw(12) << "Mcoeff/s"
+        << std::left  << std::setw(7) << "logN"
+        << std::left  << std::setw(9) << "N"
+        << std::left  << std::setw(7) << "batch"
+        << std::right << std::setw(15) << "round_trip(ms)"
+        << std::right << std::setw(13) << "fpga(ms)"
+        << std::right << std::setw(13) << "net_io(ms)"
+        << std::right << std::setw(9)  << "Mcoeff/s"
         << "\n"
-        << std::string(79, '-') << "\n";
+        << std::string(73, '-') << "\n";
 
     std::vector<CaseResult> fpga_results(NUM_CASES, {0.0, 0.0});
 
