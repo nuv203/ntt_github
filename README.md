@@ -10,14 +10,53 @@ This IP accelerates the **negacyclic Number Theoretic Transform (NTT)** — the 
 
 ## Table of Contents
 
-1. [IP Interface Definition](#1-ip-interface-definition)
-2. [IP Architecture](#2-ip-architecture)
-3. [Verification & Results](#3-verification--results)
-4. [Repository Structure](#4-repository-structure)
+1. [Project Structure](#1-project-structure)
+2. [IP Interface Definition](#2-ip-interface-definition)
+3. [IP Architecture](#3-ip-architecture)
+4. [Verification & Results](#4-verification--results)
 
 ---
 
-## 1. IP Interface Definition
+## 1. Project Structure
+
+The project is split into two independent parts:
+
+### Part 1 — HLS Kernel (`kernel/`)
+
+The FPGA IP core, implemented in Vitis HLS and synthesized for the Kria K26 SOM (`xck26-sfvc784-2LV-c`).
+
+| File | Description |
+|------|-------------|
+| [kernel/ntt.hpp](kernel/ntt.hpp) | Kernel header — public interface `ntt_kernel()`, constants `TILE_N=4096`, `MAX_BATCH=16` |
+| [kernel/ntt.cpp](kernel/ntt.cpp) | HLS kernel — all sub-modules, Barrett reduction, AXI interface pragmas, four-step path |
+| [kernel/ntt_tb.cpp](kernel/ntt_tb.cpp) | Self-contained C-simulation testbench — generates NTT-friendly primes, twiddle tables, and golden reference internally |
+| [kernel/run_hls.tcl](kernel/run_hls.tcl) | Vitis HLS TCL script — runs C-simulation then C-synthesis |
+| [kernel/extract_results.py](kernel/extract_results.py) | Parses `csynth.xml` and prints resource/pipeline tables; saves CSVs to `kernel/data/` |
+| [kernel/csynthparse.py](kernel/csynthparse.py) | Bundled XML parser for Vitis HLS synthesis reports (from course toolchain) |
+
+**To run synthesis and extract results:**
+```bash
+# From the kernel/ directory on a server with vitis_hls:
+cd kernel
+vitis_hls -f run_hls.tcl
+
+# Then extract and display results:
+python extract_results.py
+```
+
+### Part 2 — Host Application (`host/`)
+
+The ARM-side application that drives the kernel over the network. `ntt_trace_tcp_host.cpp` runs on the Zynq ARM core and manages the XRT/OpenCL kernel invocation; `ntt_tcp_client.cpp` connects from a remote machine and streams NTT requests over TCP.
+
+| File | Description |
+|------|-------------|
+| [host/ntt_trace_tcp_host.cpp](host/ntt_trace_tcp_host.cpp) | ARM-side TCP server — loads xclbin, manages kernel execution via XRT/OpenCL |
+| [host/ntt_tcp_client.cpp](host/ntt_tcp_client.cpp) | Remote TCP client — sends NTT requests and receives results; includes benchmarking |
+| [host/ntt_trace_host.cpp](host/ntt_trace_host.cpp) | Standalone host driver — direct XRT execution without TCP (for on-board testing) |
+
+---
+
+## 2. IP Interface Definition
 
 ### 1.1 Functionality
 
@@ -104,7 +143,7 @@ The IP exposes three AXI4 master ports for bulk DDR data transfer and one AXI4-L
 
 ---
 
-## 2. IP Architecture
+## 3. IP Architecture
 
 ### 2.1 System-Level Block Diagram
 
@@ -220,9 +259,9 @@ The Xilinx FFT IP (PG109) operates on complex floating-point or fixed-point arit
 
 ---
 
-## 3. Verification & Results
+## 4. Verification & Results
 
-### 3.1 Testbench (`ntt_tb.cpp`)
+### 4.1 Testbench (`kernel/ntt_tb.cpp`)
 
 The C-simulation testbench generates NTT-friendly primes dynamically, computes a golden reference using a Stockham-style NTT, and validates the HLS kernel output element-by-element.
 
@@ -242,7 +281,7 @@ The C-simulation testbench generates NTT-friendly primes dynamically, computes a
 | PQC parameters | N=256 (q=8380417), N=512/1024 (q=12289) | 1–2 |
 | Four-step (N > 4096) | 8192, 16384, 32768, 65536 | 1–4 |
 
-### 3.2 Synthesis Results
+### 4.2 Synthesis Results
 
 *To be completed after HLS synthesis run.*
 
@@ -254,7 +293,7 @@ The C-simulation testbench generates NTT-friendly primes dynamically, computes a
 | DSP48 | TBD | — | TBD |
 | Fmax | TBD MHz | 200 MHz target | TBD |
 
-### 3.3 Performance
+### 4.3 Performance
 
 *To be completed after on-board benchmarking.*
 
@@ -270,26 +309,6 @@ The C-simulation testbench generates NTT-friendly primes dynamically, computes a
 - N=1024 theoretical compute minimum: 5,120 cycles (10 stages × 512 butterflies)
 - **10–20× speedup** over ARM Cortex-A53 baseline (motivated by DSP48 vs. integer division cost for `mod_mul`)
 
-The host-side benchmarking infrastructure in `ntt_trace_host.cpp` and `ntt_tcp_client.cpp` measures wall-clock latency with warmup runs and reports mean/stddev across multiple iterations.
+The host-side benchmarking infrastructure in [host/ntt_trace_host.cpp](host/ntt_trace_host.cpp) and [host/ntt_tcp_client.cpp](host/ntt_tcp_client.cpp) measures wall-clock latency with warmup runs and reports mean/stddev across multiple iterations.
 
----
-
-## 4. Repository Structure
-
-| File | Description |
-|------|-------------|
-| `ntt.hpp` | Kernel header — public interface `ntt_kernel()`, constants `TILE_N`, `MAX_BATCH`, `MAX_LOG_N` |
-| `ntt.cpp` | HLS kernel — all sub-modules, Barrett reduction, AXI interface pragmas, four-step path |
-| `ntt_tb.cpp` | C-simulation testbench — golden reference, correctness/linearity/range tests |
-| `ntt_trace_host.cpp` | OpenCL host driver for on-board testing with benchmarking and statistics |
-| `ntt_trace_tcp_host.cpp` | TCP-based host variant for remote FPGA execution |
-| `ntt_tcp_client.cpp` | TCP client for streaming NTT requests to a board over the network |
-| `plan.md` | Detailed design document — architecture rationale, sub-module specs, interface definitions |
-
-### Running C-Simulation (Vitis HLS)
-
-1. Open Vitis HLS, create a new project targeting your Zynq part.
-2. Add `ntt.cpp` and `ntt.hpp` as design files; add `ntt_tb.cpp` as the testbench.
-3. Set the top function to `ntt_kernel`.
-4. Run **C Simulation** — all `test_ref`, `test_lin`, and `test_range` checks should pass for every configuration.
-5. Run **C Synthesis** to generate resource and timing estimates.
+See [§1 Project Structure](#1-project-structure) for the full file inventory and synthesis instructions.
