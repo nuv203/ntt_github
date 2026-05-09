@@ -11,6 +11,7 @@ This IP accelerates the **negacyclic Number Theoretic Transform (NTT)** — the 
 ## Table of Contents
 
 1. [Project Structure](#1-project-structure)
+   - [Running HLS Synthesis](#running-hls-synthesis)
 2. [IP Interface Definition](#2-ip-interface-definition)
 3. [IP Architecture](#3-ip-architecture)
 4. [Verification & Results](#4-verification--results)
@@ -31,18 +32,53 @@ The FPGA IP core, implemented in Vitis HLS and synthesized for the Kria K26 SOM 
 | [kernel/ntt.cpp](kernel/ntt.cpp) | HLS kernel — all sub-modules, Barrett reduction, AXI interface pragmas, four-step path |
 | [kernel/ntt_tb.cpp](kernel/ntt_tb.cpp) | Self-contained C-simulation testbench — generates NTT-friendly primes, twiddle tables, and golden reference internally |
 | [kernel/run_hls.tcl](kernel/run_hls.tcl) | Vitis HLS TCL script — runs C-simulation then C-synthesis |
-| [kernel/extract_results.py](kernel/extract_results.py) | Parses `csynth.xml` and prints resource/pipeline tables; saves CSVs to `kernel/data/` |
+| [kernel/hls_flow.py](kernel/hls_flow.py) | **Primary build script** — sets up the Vitis environment, runs synthesis, and prints resource/timing tables |
+| [kernel/extract_results.py](kernel/extract_results.py) | Lower-level results parser; called internally by `hls_flow.py` |
 | [kernel/csynthparse.py](kernel/csynthparse.py) | Bundled XML parser for Vitis HLS synthesis reports (from course toolchain) |
 
-**To run synthesis and extract results:**
-```bash
-# From the kernel/ directory on a server with vitis_hls:
-cd kernel
-vitis_hls -f run_hls.tcl
+### Running HLS Synthesis
 
-# Then extract and display results:
-python extract_results.py
+#### Prerequisites
+
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) — Python package manager (handles all Python dependencies automatically)
+- Vitis 2025.2 installed under `~/amd/2025.2/` (or update `VITIS_CANDIDATES` in `hls_flow.py`)
+- Ubuntu 24+ note: `hls_flow.py` automatically creates `libncurses.so.5` / `libtinfo.so.5` compatibility symlinks — no manual fix needed
+
+**Install uv** (if not already installed):
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env   # add uv to PATH for this session
 ```
+
+#### Usage
+
+All commands are run from the `kernel/` directory:
+
+```bash
+cd kernel
+
+# Full run: C-simulation + synthesis + results tables
+uv run hls_flow.py
+
+# Skip C-simulation (faster re-synthesis after code changes)
+uv run hls_flow.py --skip-csim
+
+# Parse and display results from an existing synthesis run (no rebuild)
+uv run hls_flow.py --report-only
+
+# Synthesis + update README.md §4.2 with real resource numbers
+uv run hls_flow.py --update-readme
+```
+
+`uv run` automatically installs dependencies (`pandas`, `rich`) into an isolated environment on first run — no `pip install` or `venv` setup required.
+
+#### Output
+
+A successful run prints:
+
+- **Resource Utilisation table** — LUT, FF, BRAM, DSP usage vs. available, plus estimated Fmax
+- **Loop Pipeline Summary** — II, depth, trip count, and max latency for every pipelined loop
+- CSVs saved to `kernel/data/csynth_loop_info.csv` and `kernel/data/csynth_resource_usage.csv`
 
 ### Part 2 — Host Application (`host/`)
 
@@ -283,15 +319,13 @@ The C-simulation testbench generates NTT-friendly primes dynamically, computes a
 
 ### 4.2 Synthesis Results
 
-*To be completed after HLS synthesis run.*
-
 | Resource | Used | Available | Utilization |
 |----------|------|-----------|-------------|
-| LUT | TBD | — | TBD |
-| FF | TBD | — | TBD |
-| BRAM_36K | TBD | — | TBD |
-| DSP48 | TBD | — | TBD |
-| Fmax | TBD MHz | 200 MHz target | TBD |
+| LUT      | 17173  | 117120    | 14.7%       |
+| FF       | 9090 | 234240  | 3.9%        |
+| BRAM_18K | 36   | 288      | 12.5%       |
+| DSP      | 54   | 1248     | 4.3%        |
+| Fmax     | 136.99 MHz | 200 MHz target | 68% of target |
 
 ### 4.3 Performance
 

@@ -8,7 +8,12 @@
       "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\noamt\\\\Downloads\\\\fpga-project\\\\ntt_github\\\\tmp\\\\hwdesign\" -Recurse -Force)",
       "Bash(Select-Object FullName, PSIsContainer)",
       "Bash(Format-List)",
-      "Bash(git mv *)"
+      "Bash(git mv *)",
+      "Bash(ls /tools/)",
+      "Read(//opt/**)",
+      "Read(//home/**)",
+      "Bash(/home/noamt/amd/2025.2/Vitis/scripts/vitis_hls --version)",
+      "Bash(/home/noamt/amd/2025.2/Vitis/bin/unwrapped/lnx64.o/vitis_hls --version)"
     ]
   }
 }
