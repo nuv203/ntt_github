@@ -7,7 +7,8 @@
       "Bash(git clone *)",
       "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\noamt\\\\Downloads\\\\fpga-project\\\\ntt_github\\\\tmp\\\\hwdesign\" -Recurse -Force)",
       "Bash(Select-Object FullName, PSIsContainer)",
-      "Bash(Format-List)"
+      "Bash(Format-List)",
+      "Bash(git mv *)"
     ]
   }
 }
