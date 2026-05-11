@@ -51,6 +51,10 @@ static const BenchCase BENCH_CASES[] = {
     {11,  1},
     {12,  1}, {12,  4},
     {13,  1}, {14,  1}, {15,  1}, {16,  1},
+    {17,  1}, {17,  4},
+    {18,  1}, {18,  4},
+    {19,  1}, {19,  4},
+    {20,  1}, {20,  4},
 };
 static constexpr int NUM_CASES = sizeof(BENCH_CASES) / sizeof(BENCH_CASES[0]);
 
@@ -620,6 +624,11 @@ static void run_he_benchmark(const char *server_ip, int port) {
         { 9,  2}, {10,  2}, {11,  2},
         {12,  2}, {12,  4}, {12,  8},
         {13,  2}, {14,  2},
+        {15,  2}, {16,  2},
+        {17,  2}, {17,  4},
+        {18,  2}, {18,  4},
+        {19,  2}, {19,  4},
+        {20,  2}, {20,  4},
     };
     static constexpr int NUM_HE_CASES = (int)(sizeof(HE_CASES) / sizeof(HE_CASES[0]));
     static constexpr uint32_t HE_TOTAL = NUM_WARMUP + NUM_RUNS;
