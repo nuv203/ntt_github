@@ -14,8 +14,10 @@ Usage (from kernel/ directory):
 """
 
 import argparse
+import glob
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -40,13 +42,17 @@ RESULTS_MD_PATH = REPO_ROOT / "TESTBENCH_RESULTS.md"
 # Design target (200 MHz), separate from the HLS clock constraint in run_hls.tcl (100 MHz)
 DESIGN_TARGET_MHZ = 200.0
 
-VITIS_CANDIDATES = [
-    Path("/home/noamt/amd/2025.2/Vitis/bin/vitis-run"),
-    Path("/tools/Xilinx/Vitis/2025.2/bin/vitis-run"),
-    Path("/opt/Xilinx/Vitis/2025.2/bin/vitis-run"),
+# Glob patterns searched in order; '*' matches any installed version.
+# Override all of this by setting VITIS_RUN=/path/to/vitis-run in the environment.
+VITIS_GLOB_PATTERNS = [
+    str(Path.home() / "amd" / "*" / "Vitis" / "bin" / "vitis-run"),   # ~/amd/<ver>/
+    str(Path.home() / "Xilinx" / "Vitis" / "*" / "bin" / "vitis-run"),
+    "/tools/Xilinx/Vitis/*/bin/vitis-run",
+    "/opt/Xilinx/Vitis/*/bin/vitis-run",
+    "/opt/amd/Vitis/*/bin/vitis-run",
 ]
 
-# libs that Vitis 2025.2 needs but Ubuntu 24 ships only as .so.6
+# libs that Vitis needs but Ubuntu 24 ships only as .so.6
 COMPAT_LIBS = [
     ("libncurses.so.5",  "libncurses.so.6"),
     ("libncursesw.so.5", "libncursesw.so.6"),
@@ -58,14 +64,34 @@ console = Console()
 # ── Environment helpers ───────────────────────────────────────────────────────
 
 def find_vitis_run() -> Path:
-    for p in VITIS_CANDIDATES:
+    # 1. Explicit override via environment variable
+    if env_val := os.environ.get("VITIS_RUN"):
+        p = Path(env_val)
         if p.exists():
             return p
-    # last resort: walk /home for vitis-run
-    for hit in Path("/home").rglob("bin/vitis-run"):
-        if hit.is_file():
-            return hit
-    console.print("[red]ERROR:[/] Could not find vitis-run. Set VITIS_RUN env var.")
+        console.print(f"[red]ERROR:[/] VITIS_RUN={env_val} does not exist.")
+        sys.exit(1)
+
+    # 2. $XILINX_VITIS set by Vitis settings64.sh
+    if xv := os.environ.get("XILINX_VITIS"):
+        p = Path(xv) / "bin" / "vitis-run"
+        if p.exists():
+            return p
+
+    # 3. vitis-run already on PATH
+    if found := shutil.which("vitis-run"):
+        return Path(found)
+
+    # 4. Glob common install locations (any version)
+    for pattern in VITIS_GLOB_PATTERNS:
+        matches = sorted(glob.glob(pattern))  # sorted → newest version last
+        if matches:
+            return Path(matches[-1])
+
+    console.print(
+        "[red]ERROR:[/] Could not find vitis-run.\n"
+        "  Set [bold]VITIS_RUN[/]=/path/to/vitis-run, or source Vitis settings64.sh first."
+    )
     sys.exit(1)
 
 
@@ -318,7 +344,7 @@ Estimated clock period: **{est_ns} ns**
 
 | Loop | II | Depth | Trip (max) | Latency (max) |
 |------|----|-------|-----------|---------------|
-{loop_table}
+{loop_table}Answer the problem for the Final Project.  This will take your github repo and any notes you want to give it to find files in your rep
 
 ---
 
