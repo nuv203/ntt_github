@@ -7,7 +7,7 @@
 > ```
 > Do not edit manually — changes will be overwritten on the next synthesis run.
 
-**Last updated:** 2026-05-11 23:00
+**Last updated:** 2026-05-11 23:13
 **Tool:** Vitis HLS 2025.2
 **Part:** `xck26-sfvc784-2LV-c` (Kria K26 SOM)
 **Clock constraint:** 10.0 ns (100 MHz)

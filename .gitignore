@@ -13,4 +13,5 @@ SESSION_CONTEXT.md
 
 # OS / editor
 .DS_Store
+.claude
 *.swp
