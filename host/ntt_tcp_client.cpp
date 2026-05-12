@@ -396,7 +396,8 @@ static bool run_timed(int sock, uint32_t batch, uint32_t N,
 // CPU vs FPGA comparison benchmark
 // ===================================================================
 static void run_cpu_comparison(const char *server_ip, int port,
-                               const std::vector<CaseResult> &fpga_res) {
+                               const std::vector<CaseResult> &fpga_res,
+                               bool quick) {
     std::cout << "\n=== CPU vs FPGA Comparison (Kria ARM A53 vs PL @ 200 MHz) ===\n\n";
     std::cout << std::left
               << std::setw(7)  << "logN"
@@ -411,6 +412,7 @@ static void run_cpu_comparison(const char *server_ip, int port,
     for (int ci = 0; ci < NUM_CASES; ci++) {
         uint32_t logN  = BENCH_CASES[ci].logN;
         uint32_t batch = BENCH_CASES[ci].batch;
+        if (quick && logN > 16) continue;
         uint32_t N     = 1u << logN;
         uint32_t total = NUM_WARMUP + NUM_RUNS;
 
@@ -474,7 +476,7 @@ static void run_cpu_comparison(const char *server_ip, int port,
  * The ring multiply correctness check uses random polynomials verified
  * against a schoolbook O(N^2) reference.
  */
-static void run_he_benchmark(const char *server_ip, int port) {
+static void run_he_benchmark(const char *server_ip, int port, bool quick) {
     std::cout << "\n=== Homomorphic Encryption Primitive Demo ===\n";
     std::cout << "Ring: Z_q[x] / (x^N + 1)   (negacyclic ring used in Kyber / Dilithium)\n\n";
 
@@ -651,6 +653,7 @@ static void run_he_benchmark(const char *server_ip, int port) {
     for (int ci = 0; ci < NUM_HE_CASES; ci++) {
         uint32_t logN  = HE_CASES[ci].logN;
         uint32_t batch = HE_CASES[ci].batch;
+        if (quick && logN > 14) continue;
         uint32_t N     = 1u << logN;
 
         // Build tables for this N
@@ -743,10 +746,15 @@ static void run_he_benchmark(const char *server_ip, int port) {
 // ===================================================================
 int main(int argc, char **argv) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <server-ip> [port]\n"; return 1;
+        std::cerr << "Usage: " << argv[0] << " <server-ip> [port] [--quick]\n"; return 1;
     }
     const char *server_ip = argv[1];
-    int         port      = (argc >= 3) ? std::stoi(argv[2]) : DEF_PORT;
+    int         port      = DEF_PORT;
+    bool        quick     = false;
+    for (int i = 2; i < argc; i++) {
+        if      (std::string(argv[i]) == "--quick") quick = true;
+        else port = std::stoi(argv[i]);
+    }
 
     // ── Silent warmup — open and close a connection so the first real
     //    benchmark run doesn't pay the cold-path TCP/FPGA setup cost.
@@ -843,6 +851,7 @@ int main(int argc, char **argv) {
     for (int ci = 0; ci < NUM_CASES; ci++) {
         uint32_t logN      = BENCH_CASES[ci].logN;
         uint32_t batch     = BENCH_CASES[ci].batch;
+        if (quick && logN > 16) { fpga_results[ci] = {0.0, 0.0}; continue; }
         uint32_t N         = 1u << logN;
         uint32_t total_runs = NUM_WARMUP + NUM_RUNS;
 
@@ -892,10 +901,10 @@ int main(int argc, char **argv) {
     }
 
     // ── CPU vs FPGA comparison ────────────────────────────────────────
-    run_cpu_comparison(server_ip, port, fpga_results);
+    run_cpu_comparison(server_ip, port, fpga_results, quick);
 
     // ── HE primitive demo ─────────────────────────────────────────────
-    run_he_benchmark(server_ip, port);
+    run_he_benchmark(server_ip, port, quick);
 
     std::cout << "\nDone.\n";
     return 0;
