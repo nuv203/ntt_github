@@ -1,5 +1,7 @@
 # ECE 9413 — Custom Vitis HLS IP: 4-Stage Negacyclic NTT Accelerator
 
+> **This is the initial planning document.** It was written before implementation began and contains several elements that changed during development (interface port names, memory types, Barrett reduction marked as "planned", single-path only). For the final design as actually built, see [detailed_plan.md](detailed_plan.md) and [README.md](README.md). For synthesis results, see [TESTBENCH_RESULTS.md](TESTBENCH_RESULTS.md).
+
 ## Project Plan
 
 ---
