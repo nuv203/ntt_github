@@ -67,15 +67,22 @@ ARM-side application that drives the kernel. `ntt_trace_tcp_host.cpp` runs on th
 
 #### Prerequisites
 
-- [uv](https://docs.astral.sh/uv/getting-started/installation/) — Python package manager (handles all Python dependencies automatically)
 - Vitis 2025.2 installed under `~/amd/2025.2/` (or update `VITIS_CANDIDATES` in `hls_flow.py`)
-- Ubuntu 24 note: `hls_flow.py` automatically creates `libncurses.so.5` / `libtinfo.so.5` compatibility symlinks — no manual fix needed
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) — Python package manager
 
-**Install uv** (if not already installed):
+#### Setup (one time)
+
+**1. Install uv:**
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-source $HOME/.local/bin/env   # add uv to PATH for this session
+source $HOME/.local/bin/env   # add uv to PATH
 ```
+
+**2. No further setup required.** `hls_flow.py` uses [PEP 723 inline script metadata](https://peps.python.org/pep-0723/) — on first run, `uv run` reads the `# /// script` dependency block at the top of the file and automatically installs `pandas` and `rich` into an isolated environment. No system-wide pip, no manual venv.
+
+> Re-run `source $HOME/.local/bin/env` if `uv` is not found after a fresh login.
+
+> **Ubuntu 24 note:** `hls_flow.py` automatically creates `libncurses.so.5` / `libtinfo.so.5` compatibility symlinks at runtime — no manual fix needed.
 
 #### Usage
 
@@ -96,8 +103,6 @@ uv run hls_flow.py --report-only
 # Synthesis + write results to TESTBENCH_RESULTS.md
 uv run hls_flow.py --update-results
 ```
-
-`uv run` automatically installs dependencies (`pandas`, `rich`) into an isolated environment on first run — no `pip install` or `venv` setup required.
 
 #### Output
 
