@@ -2,7 +2,8 @@
 
 **Course:** ECE 9413 — Custom Computing with FPGAs  
 **Team:** Niles Peter Villaverde · Noam Cicurel  
-**Repo:** https://github.com/nuv203/ntt_github
+**Repo:** https://github.com/nuv203/ntt_github  
+**Presentation:** [Google Slides](https://docs.google.com/presentation/d/1r_f6i9DGQIom-j2WGSby5OixlFSFNMNf/edit?usp=sharing&ouid=106036154869684749357&rtpof=true&sd=true)
 
 This IP accelerates the **negacyclic Number Theoretic Transform (NTT)** — the core polynomial-multiplication primitive in lattice-based Post-Quantum Cryptography schemes such as CRYSTALS-Kyber and CRYSTALS-Dilithium. The design is implemented in Vitis HLS targeting the Kria K26 SOM (`xck26-sfvc784-2LV-c`, Zynq UltraScale+).
 
